@@ -498,9 +498,11 @@ def process_article(token, art, do_apply, backup):
 
 
 # ====================== 各子命令 ======================
-def cmd_probe(dir_node):
+def cmd_probe(dir_node, from_index=None):
     token = get_token()
     docs = discover_dir(token, dir_node)
+    if from_index is not None:
+        docs = docs[from_index:]
     wc = [d for d in docs if d["comments"]]
     print(f"\n目录 {dir_node}：共 {len(docs)} 篇，有评论 {len(wc)} 篇"
           f"（无评论 {len(docs)-len(wc)} 篇已跳过）")
@@ -512,9 +514,11 @@ def cmd_probe(dir_node):
             print(f"   💬 「{p['quote'][:40]}」 → {rep}")
 
 
-def cmd_review(dir_node, do_apply):
+def cmd_review(dir_node, do_apply, from_index=None):
     token = get_token()
     docs = discover_dir(token, dir_node)
+    if from_index is not None:
+        docs = docs[from_index:]
     wc = [d for d in docs if d["comments"]]
     print(f"\n目录 {dir_node}：共 {len(docs)} 篇，有评论 {len(wc)} 篇"
           f"（无评论 {len(docs)-len(wc)} 篇已跳过）")
@@ -530,9 +534,11 @@ def cmd_review(dir_node, do_apply):
     print("\n⚠️ 评论均未点解决（铁律）。去推推艾特复审即可。")
 
 
-def cmd_titles(dir_node):
+def cmd_titles(dir_node, from_index=None):
     token = get_token()
     docs = discover_dir(token, dir_node)
+    if from_index is not None:
+        docs = docs[from_index:]
     print(f"\n目录 {dir_node} 各文档标题（检查「N家」是否与正文相符）：")
     for d in docs:
         obj = d["obj"]
@@ -592,10 +598,16 @@ def main():
     titles = "--titles" in args
     fix_title = "--fix-title" in args
     restore = "--restore" in args
+    from_index = None
 
     for j, a in enumerate(args):
         if a == "--dir" and j + 1 < len(args):
             dir_node = args[j + 1]
+        if a == "--from-index" and j + 1 < len(args):
+            try:
+                from_index = int(args[j + 1])
+            except ValueError:
+                from_index = None
         if a == "--fix-title":
             obj = args[j + 1] if j + 1 < len(args) else None
             newt = args[j + 2] if j + 2 < len(args) else None
@@ -622,10 +634,10 @@ def main():
         sys.exit(1)
 
     if titles:
-        return cmd_titles(dir_node)
+        return cmd_titles(dir_node, from_index)
     if probe:
-        return cmd_probe(dir_node)
-    return cmd_review(dir_node, do_apply)
+        return cmd_probe(dir_node, from_index)
+    return cmd_review(dir_node, do_apply, from_index)
 
 
 if __name__ == "__main__":
