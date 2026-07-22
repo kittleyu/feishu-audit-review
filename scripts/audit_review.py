@@ -258,8 +258,10 @@ def classify(quote, reply):
     if "联系方式" in r:
         return ("sentence_delete", None, "联系方式→整句删除")
 
-    # 2) 删除类（不当/删除/去掉/删掉/删去）
-    if any(k in r for k in ("不当", "删除", "去掉", "删掉", "删去")):
+    # 2) 删除类（不当/删除/去掉/删掉/删去/违禁/拉踩/宣传/无依据/隐性）
+    #    “客户违禁词”“隐性拉踩竞品”“隐性宣传”“无依据的用户反馈” 都表示删 quote
+    if any(k in r for k in ("不当", "删除", "去掉", "删掉", "删去",
+                            "违禁", "拉踩", "宣传", "无依据", "隐性")):
         return ("delete", None, f"删除短语「{q}」")
 
     # 3) 成立日期核对：查及成立日期：XXXX
@@ -279,11 +281,22 @@ def classify(quote, reply):
             return ("delete_word", q, f"绝对化用语删词「{q}」")
         return ("human", None, f"绝对化用语，未给替换词：{r}")
 
-    # 6) 无法核实（曲合期货整段）→ 结构性，需人工决定删整段/改写
-    if "未查及" in r or "未查" in r or "公开平台未查" in r:
+    # 6) 无法核实 / 有待核实（曲合期货整段、回测功能待核等）→ 需人工
+    if any(k in r for k in ("未查及", "未查", "公开平台未查", "有待核实", "核实")):
         return ("human", None, f"无法核实，需人工决定：{r}")
 
-    # 7) 干净替换词（无指令词）→ 覆盖 靠前→第一、全X→多X、靠前家→前列的 等
+    # 7) 改为 X（改为"约牛股票APP" / 改为：K线图 / 改为"XXX"）→ 提取 X 替换
+    m = re.search(r"^改为[：:]?\s*[\"'\u201c\u201d\u300c\u300d]?(.*?)[\"'\u201c\u201d\u300c\u300d]?$", r)
+    if m:
+        val = m.group(1).strip()
+        if val:
+            return ("replace", val, f"「{q}」→「{val}」(改为)")
+
+    # 8) 长文语义纠正（无明确替换词，如“将产品核心价值仅概括为…严重不符”）→ 人工
+    if len(r) > 25:
+        return ("human", None, f"长文语义纠正，需人工：{r[:30]}…")
+
+    # 9) 干净替换词（无指令词）→ 覆盖 靠前→第一、全X→多X、靠前家→前列的、资质替换 等
     if not any(kw in r for kw in ("建议", "需", "请")):
         return ("replace", r, f"「{q}」→「{r}」")
 
@@ -295,6 +308,52 @@ def split_sentences(text):
     return [p for p in re.split(r"(?<=。|！|？|；)", text) if p.strip()]
 
 
+# 片段断点（到此为止算一个连续词）
+_SEG_BREAK = "，。、；：！？\n\r\t ）)\"\u201c\u201d"
+
+
+def _segment_at(text, pos, anchor_len):
+    """从 pos 开始取到下一个断点（标点/空白/右引号/句末）的片段"""
+    end = pos + anchor_len
+    while end < len(text) and text[end] not in _SEG_BREAK:
+        end += 1
+    return text[pos:end]
+
+
+def fuzzy_locate(phrase, btext):
+    """评论 quote 与正文有出入（审核员手敲变体/截断）时，用 quote 前缀在块里
+    定位实际片段。仅对短 phrase（<=15字）启用，长段交给人工避免残缺删。"""
+    if len(phrase) <= 1:
+        return None
+    for al in range(min(len(phrase), 10), 1, -1):
+        anchor = phrase[:al]
+        for bt in btext.values():
+            pos = bt.find(anchor)
+            if pos >= 0:
+                seg = _segment_at(bt, pos, al)
+                if len(seg) >= al:
+                    return seg
+    return None
+
+
+def locate_long_delete(phrase, btext):
+    """删除类长段 quote（>15字）的兜底：用 quote 前缀在块中定位起始，
+    摘出从起点到下一句末（。！？；）的片段作为实际删除内容，落实「标了要删就删」。"""
+    anchor = phrase[:min(len(phrase), 30)]
+    for bid, bt in btext.items():
+        pos = bt.find(anchor)
+        if pos >= 0:
+            end = pos + len(anchor)
+            while end < len(bt) and bt[end] not in "。！？；\n":
+                end += 1
+            if end < len(bt):   # 含句末标点
+                end += 1
+            frag = bt[pos:end]
+            if frag.strip():
+                return bid, frag
+    return None, None
+
+
 def apply_edit(old, action, phrase, value):
     if action == "sentence_delete":
         kept = [s for s in split_sentences(old)
@@ -302,17 +361,12 @@ def apply_edit(old, action, phrase, value):
         new = "".join(kept)
         return new if new.strip() else old   # 整块清空则回退（避免空块）
     if action == "delete_word":
-        return old.replace(phrase, "", 1)
+        return old.replace(phrase, "")       # 全替换（同块/同词多出现都改）
     if action == "delete":
-        new = old
-        for suf in ("，", "。", "、", "等", "；"):
-            if phrase + suf in new:
-                new = new.replace(phrase + suf, "", 1)
-                break
-        if new == old:
-            new = old.replace(phrase, "", 1)
-        return new
-    return old.replace(phrase, value, 1)
+        # 删短语及其后一个常见标点（，。、；：），全替换
+        new = re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
+        return new if new.strip() else old   # 整块清空则回退
+    return old.replace(phrase, value)        # replace 全替换（含「改为 X」「资质」等）
 
 
 # ====================== 发现 / 处理 ======================
@@ -338,6 +392,7 @@ def process_article(token, art, do_apply, backup):
     btext = {b.get("block_id"): extract_block_text(b) for b in blocks}
 
     edits, human = {}, []
+    title_candidates = []   # 标题候选（品牌名替换/绝对化删词也要落到标题）
     for cmt in comments:
         p = parse_comment_text(cmt)
         quote = (p.get("quote") or "").strip()
@@ -347,20 +402,41 @@ def process_article(token, art, do_apply, backup):
             human.append({"quote": quote, "reply": reply, "note": note})
             continue
         phrase = collapse_dup(quote) if action == "replace" else quote
+        # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word
+        if action in ("replace", "delete_word") and phrase:
+            title_candidates.append((action, phrase, value, note))
         # 同词多块：必须应用到所有含该短语的块（否则评论锚在别的重复块上显得没改）
         hit = [bid for bid, bt in btext.items() if phrase in bt]
         if not hit:
-            human.append({"quote": quote, "reply": reply,
-                          "note": f"全文未找到「{phrase}」"})
-            continue
+            # 删除类长段（>15字）：用 quote 前缀定位并摘句删除，落实「标了要删就删」
+            if action == "delete" and len(phrase) > 15:
+                bid2, frag = locate_long_delete(phrase, btext)
+                if bid2 and frag:
+                    hit, phrase = [bid2], frag
+            # 模糊兜底：短 phrase（<=15字）评论 quote 与正文有出入（手敲变体/截断）
+            if not hit and len(phrase) <= 15:
+                fphrase = fuzzy_locate(phrase, btext)
+                if fphrase and fphrase != phrase:
+                    hit = [bid for bid, bt in btext.items() if fphrase in bt]
+                    phrase = fphrase
+            if not hit:
+                human.append({"quote": quote, "reply": reply,
+                              "note": f"全文未找到「{phrase}」"})
+                continue
         for bid in hit:
             e = edits.setdefault(bid, {"original": btext[bid],
                                        "new": btext[bid], "ops": []})
-            e["ops"].append((action, phrase, value, note))
+            # 去重：同一块内相同 (action, phrase, value) 只保留一个，
+            # 否则 replace 的 value 含 phrase（如 约牛股票→约牛股票APP）会被多次叠加成 APPAPP
+            key = (action, phrase, value)
+            if not any(o[:3] == key for o in e["ops"]):
+                e["ops"].append((action, phrase, value, note))
 
     for bid, e in edits.items():
         new = e["original"]
-        for a, ph, v, _ in e["ops"]:
+        # 同一块多条编辑：按 phrase 长度从长到短，避免短词先替换破坏长词
+        #   （如「持证老师团队」须先于「持证老师」）
+        for a, ph, v, _ in sorted(e["ops"], key=lambda x: -len(x[1])):
             new = apply_edit(new, a, ph, v)
         e["new"] = new
         if new == e["original"]:
@@ -390,6 +466,33 @@ def process_article(token, art, do_apply, backup):
             else:
                 disp = f"「{ph}」→「{v}」"
             print(f"       • {disp}  ({note})")
+    # 标题参与替换（品牌名等，如 约牛股票→约牛股票APP；绝对化短词删词）
+    title = get_doc_title(token, obj) or ""
+    if title and title_candidates:
+        title_ops = []
+        for (a, ph, v, n) in title_candidates:
+            if ph and ph in title:
+                key = (a, ph, v)
+                if not any(o[:3] == key for o in title_ops):
+                    title_ops.append((a, ph, v, n))
+        new_title = title
+        for a, ph, v, _ in sorted(title_ops, key=lambda x: -len(x[1])):
+            new_title = apply_edit(new_title, a, ph, v)
+        if new_title != title:
+            if do_apply:
+                resp = update_doc_title(token, obj, new_title)
+                if resp.get("code") == 0:
+                    back = get_doc_title(token, obj)
+                    if back == new_title:
+                        backup.setdefault(obj, {})["__TITLE__"] = title
+                        print(f"  ✅ 标题: 《{title}》→《{new_title}》 校验一致")
+                    else:
+                        print(f"  ⚠️ 标题写回校验不符: 《{back}》")
+                else:
+                    print(f"  ❌ 标题写回失败 code={resp.get('code')} {resp.get('msg')}")
+            else:
+                print(f"  🔍 [预览] 标题: 《{title}》→《{new_title}》")
+
     for h in human:
         print(f"  👤 需人工: {h['note']} | 「{h['quote'][:24]}」→「{h['reply'][:24]}」")
 
@@ -460,6 +563,15 @@ def cmd_restore(backup_file):
     total = 0
     for obj, blocks in backup.items():
         for bid, original in blocks.items():
+            if bid == "__TITLE__":   # 标题还原（撤销 --apply 的标题改动）
+                resp = update_doc_title(token, obj, original)
+                ok = resp.get("code") == 0
+                if ok:
+                    ok = get_doc_title(token, obj) == original
+                tag = "✅" if ok else "❌"
+                print(f"  {tag} 还原标题 (obj={obj[:12]})")
+                total += 1
+                continue
             resp = update_block_text(token, obj, bid, original)
             ok = resp.get("code") == 0
             if ok:
