@@ -127,6 +127,57 @@ def get_doc_comments(token, obj_token):
     return out
 
 
+def enrich_reactions(token, obj_token, comments):
+    """用批量评论接口取回「点赞/reaction」数据（need_reaction=true）。
+
+    列表接口 GET /comments 不返回该字段，需额外一次 batch_query。
+    注意：reactions 是敏感字段，需应用具备「获取用户 ID」权限范围；
+    若权限不足，reactions 会返回为空（None）——此时点赞检测不生效，
+    退回「找不到锚点→归人工」的现行为，绝不误删、绝不漏改。
+    """
+    if not comments:
+        return
+    ids = [c.get("comment_id") for c in comments if c.get("comment_id")]
+    if not ids:
+        return
+    url = f"https://open.feishu.cn/open-apis/drive/v1/files/{obj_token}/comments/batch_query"
+    try:
+        d = api("POST", url, token,
+                body={"comment_ids": ids, "need_reaction": True},
+                params={"file_type": "docx"})
+    except Exception:
+        return
+    if d.get("code") not in (0, None):
+        return
+    items = ((d.get("data") or {}).get("comments")
+             or (d.get("data") or {}).get("items") or [])
+    by_id = {it.get("comment_id"): it for it in items}
+    for c in comments:
+        it = by_id.get(c.get("comment_id"))
+        if it is not None:
+            c["reactions"] = it.get("reactions")
+
+
+def is_comment_liked(cmt):
+    """评论是否被点赞（即用户已手动改过，按铁律直接忽略，不再归人工）。
+
+    兼容 reactions 的多种返回形态：list（非空）/ dict（含非空值）。
+    """
+    r = cmt.get("reactions") if isinstance(cmt, dict) else None
+    if not r:
+        return False
+    if isinstance(r, list):
+        return len(r) > 0
+    if isinstance(r, dict):
+        for v in r.values():
+            if isinstance(v, list) and v:
+                return True
+            if isinstance(v, dict) and v:
+                return True
+        return bool(r)
+    return False
+
+
 def get_doc_blocks(token, obj_token):
     url = f"https://open.feishu.cn/open-apis/docx/v1/documents/{obj_token}/blocks/{obj_token}/children"
     out, pt = [], None
@@ -476,6 +527,8 @@ def discover_dir(token, node_token):
         if n.get("obj_type") == "docx" and n.get("obj_token"):
             comments = get_doc_comments(token, n["obj_token"])
             unres = [c for c in comments if c.get("is_solved") != True]
+            if unres:
+                enrich_reactions(token, n["obj_token"], unres)
             docs.append({"i": i, "title": n.get("title", ""),
                          "obj": n["obj_token"], "comments": unres})
     return docs
@@ -529,7 +582,14 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
     blocks = get_doc_blocks(token, obj)
     btext = {b.get("block_id"): extract_block_text(b) for b in blocks}
 
-    edits, human = {}, []
+    edits, human, ignored = {}, [], []
+    def unfound(q, r, n, c):
+        """找不到锚点时的处置：已点赞(用户已手动改)→忽略；否则→归人工。"""
+        if is_comment_liked(c):
+            ignored.append({"quote": q, "reply": r,
+                            "note": n + "（已点赞，用户已手动改→忽略）"})
+        else:
+            human.append({"quote": q, "reply": r, "note": n})
     title_candidates = []   # 标题候选（品牌名替换/绝对化删词也要落到标题）
     for cmt in comments:
         p = parse_comment_text(cmt)
@@ -551,8 +611,7 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
                         thit = [bid for bid, bt in btext.items() if ftok in bt]
                         tok = ftok
                 if not thit:
-                    human.append({"quote": tok, "reply": reply,
-                                  "note": f"xx代替未找到「{tok}」"})
+                    unfound(tok, reply, f"xx代替未找到「{tok}」", cmt)
                     continue
                 for bid in thit:
                     e = edits.setdefault(bid, {"original": btext[bid],
@@ -585,8 +644,7 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
                     hit = [bid for bid, bt in btext.items() if fphrase in bt]
                     phrase = fphrase
             if not hit:
-                human.append({"quote": quote, "reply": reply,
-                              "note": f"全文未找到「{phrase}」"})
+                unfound(quote, reply, f"全文未找到「{phrase}」", cmt)
                 continue
         for bid in hit:
             e = edits.setdefault(bid, {"original": btext[bid],
@@ -688,6 +746,9 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
 
     for h in human:
         print(f"  👤 需人工: {h['note']} | 「{h['quote'][:24]}」→「{h['reply'][:24]}」")
+    for ig in ignored:
+        print(f"  🙈 已忽略(点赞): {ig['note']} | 「{ig['quote'][:24]}」")
+    return len(human), len(ignored)
 
 
 # ====================== 各子命令 ======================
@@ -716,15 +777,19 @@ def cmd_review(dir_node, do_apply, from_index=None, client_rules=None):
     print(f"\n目录 {dir_node}：共 {len(docs)} 篇，有评论 {len(wc)} 篇"
           f"（无评论 {len(docs)-len(wc)} 篇已跳过）")
     backup = {}
+    tot_h = tot_ig = 0
     for d in wc:
         print(f"\n{'='*66}\n[{d['i']}] 《{d['title'][:40]}》\n{'='*66}")
-        process_article(token, d, do_apply, backup, extra_rules=client_rules)
+        h, ig = process_article(token, d, do_apply, backup, extra_rules=client_rules)
+        tot_h += h
+        tot_ig += ig
     if do_apply and backup:
         fn = f"{dir_node}_backup.json"
         with open(fn, "w", encoding="utf-8") as f:
             json.dump(backup, f, ensure_ascii=False, indent=2)
         print(f"\n✅ 备份 {fn}（{sum(len(v) for v in backup.values())} 块）")
-    print("\n⚠️ 评论均未点解决（铁律）。交由审核人员处理评论状态即可。")
+    print(f"\n⚠️ 评论均未点解决（铁律）。自动忽略(已点赞) {tot_ig} 条，仍需人工 {tot_h} 条。")
+    print("   交由审核人员处理评论状态即可。")
 
 
 def cmd_titles(dir_node, from_index=None):

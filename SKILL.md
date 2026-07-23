@@ -16,6 +16,7 @@ description: 飞书 GEO 文章审核改稿闭环。给定客户目录 wiki node�
 3. **客户专属替换规则不串用**：某一客户特有的公司名替换（如「A公司→B公司」）是该企业专属，不要套用到其他客户。公司名更正必须由该客户的评论驱动（如「旧名，已更名为 X」）。通用规则仅限：靠前→第一、靠前家→前列的、全X→多X、删来源引用、（来源：企业知识库）/从知识库信息来看、联系方式整句删。
 4. **同词多块**：substring 替换必须应用到「所有含该短语的块」，不能只改第一个命中块（否则评论锚在别的重复块上会显得没改）。
 5. **子串替换要保留块内其他文本**，整块覆盖会互相 clobber —— 同一块多条评论先合并再写一次。
+6. **找不到锚点先查点赞**：正文确实找不到评论标注的原文片段时，若评论**已被点赞**（用户在飞书里对改过的评论点赞），说明用户已手动改完 → **直接忽略，不归人工**；只有**未点赞又找不到锚点**的才归人工（疑似生成文与审核模板版本差异，需人工确认）。点赞数据通过 `POST /drive/v1/files/{obj}/comments/batch_query`（`need_reaction=true`）获取；该字段是敏感字段，需应用具备「获取用户 ID」权限范围，权限不足时 reactions 返回空、点赞检测不生效（安全退回人工，绝不误删/漏改）。
 
 ## API 要点（已验证）
 - 凭据：飞书 APP_ID/APP_SECRET（同 feishu-wiki-paste bot），`POST /auth/v3/tenant_access_token/internal` 取 tenant_access_token。凭据**不要硬编码**到脚本：从环境变量 `FEISHU_APP_ID`/`FEISHU_APP_SECRET` 或同目录 `.env` 文件读取（仓库附 `.env.example` 模板，`.env` 已被 git 忽略）。
@@ -26,6 +27,7 @@ description: 飞书 GEO 文章审核改稿闭环。给定客户目录 wiki node�
 - 评论 reply 的 content 是 **dict**（elements[].text_run.text），不是 JSON 字符串；主评论 content 是 JSON 字符串数组。
 - 目录子节点：`GET /open-apis/wiki/v2/spaces/{space_id}/nodes?parent_node_token=...`，**务必把 params 传进去**（曾因漏传 params 一直返回空间根节点）。
 - 评论 anchor 经常为 None → 靠 quote 子串匹配定位块；多块同词时会指错块，通用方案必须支持「人工指定目标块」。
+- **取评论点赞**：列表接口 `GET /comments` 不返回点赞/reaction；需额外 `POST /drive/v1/files/{obj}/comments/batch_query`（`body={"comment_ids":[...],"need_reaction":true}`，`file_type` 放 query 参数）才能拿到 `reactions` 字段。reactions 是敏感字段，应用需开「获取用户 ID」权限范围，否则返回空（点赞检测不生效，安全退回人工）。
 
 ## 评论模式与分类器（通用，不依赖具体客户）
 评论结构 = 高亮原文片段(quote) + 回复(reply_text)。`classify(quote, reply)`：
