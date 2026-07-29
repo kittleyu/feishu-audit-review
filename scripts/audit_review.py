@@ -548,6 +548,16 @@ def apply_edit(old, action, phrase, value):
     if action == "delete_word":
         return old.replace(phrase, "")       # 全替换（同块/同词多出现都改）
     if action == "delete":
+        if phrase == "最":
+            # 绝对化用词「最」删除时，保护时间/顺序/方位复合词
+            # （最后/最终/最初/最近/最新/最早/最前/最上…），这些不是最高级，
+            # 删「最」会破坏句子（最后一环→后一环）。只删「最+自由词」的绝对化用法。
+            PROTECT = "后终初近新早先前上中下内外底高"
+            tmp = re.sub(r"最([" + PROTECT + r"])",
+                         lambda m: "\x00" + m.group(1), old)   # 占位保护
+            tmp = re.sub(re.escape(phrase) + r"[，。、；：]?", "", tmp)  # 删其余「最」
+            tmp = tmp.replace("\x00", "最")                     # 还原保护
+            return tmp if tmp.strip() else old
         # 删短语及其后一个常见标点（，。、；：），全替换
         new = re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
         return new if new.strip() else old   # 整块清空则回退
