@@ -379,6 +379,13 @@ def classify(quote, reply):
         newname = m.group(1).strip().rstrip("。，、")
         return ("replace", newname, f"「{collapse_dup(q)}」→「{newname}」(更名)")
 
+    # 5.5) 规范名称：X → 更名（剥离引导词「规范名称：」取纯名称）
+    #      审核用「规范名称：新名」给更名，否则整串(含「规范名称：」)会写进正文
+    m = re.search(r"规范名称[:：]\s*(.+?)\s*$", r)
+    if m:
+        newname = m.group(1).strip().rstrip("。，、")
+        return ("replace", newname, f"「{collapse_dup(q)}」→「{newname}」(规范名称更名)")
+
     # 6) 语句残缺 / 未找到相关数据来源 -> 删整句（无来源的例证/残缺句应去除，全部接受）
     if "语句残缺" in r or "残缺" in r:
         return ("sentence_delete", q, f"语句残缺→删整句「{q}」")
@@ -405,6 +412,13 @@ def classify(quote, reply):
 
     # 9.5) 查及位于 X（给出新地址但带引导词）→ 剥离引导词取纯地址
     m = re.search(r"^(?:查及位于|查及)\s*(.+?)\s*$", r)
+    if m:
+        newaddr = m.group(1).strip()
+        return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
+
+    # 9.55) 地址为/地址是/地址：X（给出新地址但带引导词）→ 剥离引导词取纯地址
+    #       审核用「地址为X」给新地址，否则整串(含「地址为」)会写进正文
+    m = re.search(r"^(?:地址为|地址是|地址[:：])\s*(.+?)\s*$", r)
     if m:
         newaddr = m.group(1).strip()
         return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
