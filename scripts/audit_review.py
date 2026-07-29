@@ -417,6 +417,13 @@ def classify(quote, reply):
     if "已注销" in r:
         return ("delete", None, f"机构已注销→删表述「{q}」")
 
+    # 9.8) 动作标签（修改/格式规范/规范/调整/完善/整改/优化）无具体替换值 → 删短语
+    #      审核给的是「动作指令」而非替换词；若当成替换值会把正文替换成
+    #      「修改/格式规范」四字（错误）。标了就删 quote 本身。
+    if any(k in r for k in ("格式规范", "整改", "调整", "完善", "优化")) \
+            or r.strip() in ("修改", "规范", "规范表述"):
+        return ("delete", None, f"动作标签「{r}」→删短语「{q}」")
+
     # 10) 干净替换词（无指令词）→ 覆盖 靠前→第一、全X→多X、靠前家→前列的、
     #     资质替换、直接给替换值(如 AAA 统一更正「2019年期货行业首家取得…」) 等
     if not any(kw in r for kw in ("建议", "需", "请")):
@@ -561,6 +568,17 @@ def apply_edit(old, action, phrase, value):
         # 删短语及其后一个常见标点（，。、；：），全替换
         new = re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
         return new if new.strip() else old   # 整块清空则回退
+    if action == "replace" and len(phrase) == 1:
+        # 单字替换为多字 value：整词感知，避免无差别替换破坏正文复合词
+        if phrase == "全" and "多品种" in value:
+            # 仅「全品种」占位整词替换为「多品种」；保护「全面/全部/完全/全覆盖」等
+            # （曾见正文 13 处「全面结算会员」被误改成「多品种面结算会员」的灾难性误伤）
+            tmp = old.replace("全品种", "多品种")
+            return tmp if tmp.strip() else old
+        if phrase == "最" and value == "较早":
+            # 审核把「最早」里的「最」标成「较早」，本意是「最早」→「较早」
+            tmp = old.replace("最早", "较早")
+            return tmp if tmp.strip() else old
     return old.replace(phrase, value)        # replace 全替换（含「改为 X」「资质」等）
 
 
