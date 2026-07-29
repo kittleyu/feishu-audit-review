@@ -301,7 +301,7 @@ def collapse_dup(text):
 def parse_suggest(r, q):
     """解析 改为/可改为/建议修改/建议改为 的替换值；
     多值（如「全流程」「全方位」→「多环节服务」「多领域合作」）按 quote 在
-    列举中的出现顺序对应取值，避免乱配。"""
+    列举中的出现顺序对应取值，避免乱配。回复含「或者/或」二选一时取第一个。"""
     # 必须锚定「建议改为/建议修改为/改为/可改为」标记，只从标记后取值；
     # 否则 (.+) 会从位置0贪婪捕获整句，把列举词(全流程/全方位)也卷进 vals，
     # 导致 vals[0] 取到「全流程」自己而非建议值。
@@ -310,17 +310,24 @@ def parse_suggest(r, q):
         return None
     after = r[m.end():]
     vals = re.findall(r'[「"](.*?)[」"]', after)
-    if not vals:
+    if vals:
+        # 多值：按 quote 在标记前列举里的顺序对应取值
+        pre = r[:m.start()]
+        pre_list = re.findall(r'[「"](.*?)[」"]', pre)
+        if q in pre_list and pre_list.index(q) < len(vals):
+            v = vals[pre_list.index(q)]
+        else:
+            v = vals[0]
+    else:
         v = after.strip().lstrip("—-").strip('。，、').strip('「"」"')
-        return v or None
-    # 多值：按 quote 在标记前列举里的顺序对应取值
-    pre = r[:m.start()]
-    pre_list = re.findall(r'[「"](.*?)[」"]', pre)
-    if q in pre_list:
-        idx = pre_list.index(q)
-        if idx < len(vals):
-            return vals[idx]
-    return vals[0]
+    if not v:
+        return None
+    # 二选一（"或者"/"或"）：取第一个，按评论直接改（审核给了任一可接受）
+    for sep in ("或者", "或"):
+        if sep in v:
+            v = v.split(sep)[0].strip()
+            break
+    return v
 
 
 def classify(quote, reply):
@@ -336,6 +343,10 @@ def classify(quote, reply):
     # 1) 联系方式 -> 整句删除（按 。！？； 切句，删含联系渠道关键词的句子）
     if "联系方式" in r:
         return ("sentence_delete", None, "联系方式→整句删除")
+
+    # 1.5) 地址有误 → 删除该错误地址短语（审核未给新值，按决策直接删表述）
+    if "地址错误" in r or "地址有误" in r:
+        return ("delete", None, f"删除错误地址「{q}」")
 
     # 2) 用xx代替（具体公司/机构名匿名化，替换成 xx + 行业后缀）
     #    必须早于 #3 删除类，否则"具体公司"会被误判为删短语（整串删掉而非替换成xx）
@@ -366,6 +377,16 @@ def classify(quote, reply):
     if "未找到相关数据" in r or "未找到相关" in r:
         return ("sentence_delete", q, f"无数据来源→删整句「{q}」")
 
+    # 6.8) 具体数据无法溯源核实 → 删整句（无来源数据表述应去除，全部接受；
+    #      须早于 #8「核实」关键词，否则会被误判归人工）
+    if "无法溯源核实" in r or "数据无法溯源" in r:
+        return ("sentence_delete", q, f"数据无法溯源→删整句「{q}」")
+
+    # 6.5) 建议改为/可改为 X（置于绝对化删词前，避免「建议改为知名专家」被当成纯删词）
+    sv = parse_suggest(r, q)
+    if sv:
+        return ("replace", sv, f"「{q}」→「{sv}」(改为)")
+
     # 7) 绝对化用语/用词/承诺（无替换词）→ 删整个 quote（去绝对化，全部接受）
     if "绝对化" in r or "绝对" in r:
         return ("delete", None, f"绝对化删词「{q}」")
@@ -374,10 +395,19 @@ def classify(quote, reply):
     if any(k in r for k in ("有待核实", "核实", "未查及", "未查", "公开平台未查")):
         return ("human", None, f"无法核实，需人工决定：{r}")
 
-    # 9) 改为 X（改为/可改为/建议修改/建议改为，多值按 quote 顺序对应）
-    sv = parse_suggest(r, q)
-    if sv:
-        return ("replace", sv, f"「{q}」→「{sv}」(改为)")
+    # 9.5) 查及位于 X（给出新地址但带引导词）→ 剥离引导词取纯地址
+    m = re.search(r"^(?:查及位于|查及)\s*(.+?)\s*$", r)
+    if m:
+        newaddr = m.group(1).strip()
+        return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
+
+    # 9.6) 医疗保障承诺类违规表述 → 整句删（不应替换成"医疗保障承诺"四字）
+    if "医疗保障承诺" in r or "医疗承诺" in r:
+        return ("sentence_delete", q, f"违规承诺表述→整句删「{q}」")
+
+    # 9.7) 机构已注销/注销 → 删该机构虚假表述（标了就删，不替换成"已注销"四字）
+    if "已注销" in r:
+        return ("delete", None, f"机构已注销→删表述「{q}」")
 
     # 10) 干净替换词（无指令词）→ 覆盖 靠前→第一、全X→多X、靠前家→前列的、
     #     资质替换、直接给替换值(如 AAA 统一更正「2019年期货行业首家取得…」) 等
