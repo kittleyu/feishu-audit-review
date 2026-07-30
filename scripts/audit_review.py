@@ -28,6 +28,15 @@ import os
 
 import requests
 
+# 强制 stdout/stderr 使用 UTF-8，避免 Windows GBK 终端下打印 emoji/中文时崩溃
+try:
+    if hasattr(sys.stdout, "reconfigure"):
+        sys.stdout.reconfigure(encoding="utf-8")
+    if hasattr(sys.stderr, "reconfigure"):
+        sys.stderr.reconfigure(encoding="utf-8")
+except Exception:
+    pass
+
 # ====================== 凭据 / 常量 ======================
 # 凭据从环境变量或同目录 .env 文件读取（.env 不要提交到 git）
 #   FEISHU_APP_ID=cli_xxxxxxxx
@@ -365,6 +374,18 @@ def parse_suggest(r, q):
     return v
 
 
+def normalize_date_cn(s):
+    """把「2011-06-28 / 2011.06.28 / 2011年06月28日」统一成「2011年6月28日」"""
+    s = s.strip().strip("。，、")
+    m = re.match(r"(\d{4})[-/.年](\d{1,2})[-/.月](\d{1,2})日?", s)
+    if m:
+        return f"{m.group(1)}年{int(m.group(2))}月{int(m.group(3))}日"
+    m2 = re.match(r"(\d{4})(?:年)?", s)
+    if m2:
+        return f"{m2.group(1)}年"
+    return s
+
+
 def classify(quote, reply):
     """返回 (action, value, note); action ∈
        {replace, delete, delete_word, sentence_delete, xx_replace, human}"""
@@ -402,6 +423,26 @@ def classify(quote, reply):
     if any(k in r for k in ("无意义", "错别字", "语病", "冗余", "多余")) \
             or ("英文" in r and "改为" not in r):
         return ("delete", None, f"标注「{r}」→删短语「{q}」")
+
+    # 3.7) 复合更正：成立日期 + 地址（"成立日期：X；地址：Y" / "注册日期：X；地址：Y"）
+    #      审核把两类更正写在同一回复里；拆成多子串替换（仅替换引用段里确实存在的
+    #      旧日期/旧地址，绝不把整段 quote 替换成回复原文）。
+    m_cdate = re.search(r"(?:成立日期|注册日期)[:：]\s*([0-9]{4}[-/.年]?[0-9]{0,2}[-/.]?[0-9]{0,2})", r)
+    m_caddr = re.search(r"地址[:：]\s*([^；;]+)", r)
+    if m_cdate or m_caddr:
+        subs = []
+        if m_cdate:
+            newd = normalize_date_cn(m_cdate.group(1))
+            qd = re.search(r"\d{4}年\d{1,2}月\d{1,2}日|\d{4}年\d{1,2}月|\d{4}年", q)
+            if qd:
+                subs.append((qd.group(0), newd))
+        if m_caddr:
+            newa = m_caddr.group(1).strip().rstrip("；;。、")
+            qa = re.search(r"(?:[\u4e00-\u9fa5]{2,}(?:省|市|区|县))?[\u4e00-\u9fa5]*(?:路|街道|街|号|大厦|广场|镇|乡)[^，。；]*", q)
+            if qa:
+                subs.append((qa.group(0), newa))
+        if subs:
+            return ("multi_replace", subs, f"复合更正：{subs}")
 
     # 4) 成立日期核对：查及成立日期：XXXX
     m = re.search(r"查[及找]?成立日期[:：]\s*([0-9]{4}[-/.年]?[0-9]{0,2}[-/.]?[0-9]{0,2})", r)
@@ -442,11 +483,12 @@ def classify(quote, reply):
         return ("delete", None, f"绝对化删词「{q}」")
 
     # 8) 无法核实 / 有待核实（如某家待核实、整家删除等）→ 人工
-    if any(k in r for k in ("有待核实", "核实", "未查及", "未查", "公开平台未查")):
+    if any(k in r for k in ("有待核实", "核实", "未查及", "未查", "公开平台未查",
+                            "未能验证", "无法验证")):
         return ("human", None, f"无法核实，需人工决定：{r}")
 
     # 9.5) 查及位于 X（给出新地址但带引导词）→ 剥离引导词取纯地址
-    m = re.search(r"^(?:查及位于|查及)\s*(.+?)\s*$", r)
+    m = re.search(r"^(?:查及位于|查及)[:：]?\s*(.+?)\s*$", r)
     if m:
         newaddr = m.group(1).strip()
         return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
@@ -507,10 +549,15 @@ def _segment_at(text, pos, anchor_len):
 
 def fuzzy_locate(phrase, btext):
     """评论 quote 与正文有出入（审核员手敲变体/截断）时，用 quote 前缀在块里
-    定位实际片段。仅对短 phrase（<=15字）启用，长段交给人工避免残缺删。"""
+    定位实际片段。仅对短 phrase（<=15字）启用，长段交给人工避免残缺删。
+    守卫：极短串（<=4字）要求近乎完全匹配（前 len-1 字须命中），否则返回 None。
+    避免 "2006" 被弱前缀 "20" 误匹配到正文 "2026年…" 后将整句替换成 "2011" 的
+    灾难（极短串模糊匹配几乎必为误判，应归人工）。"""
     if len(phrase) <= 1:
         return None
-    for al in range(min(len(phrase), 10), 1, -1):
+    # 匹配质量要求：极短串必须高比例前缀命中；长串才容忍尾部变体
+    min_al = 3 if len(phrase) > 4 else len(phrase)
+    for al in range(min(len(phrase), 10), min_al - 1, -1):
         anchor = phrase[:al]
         for bt in btext.values():
             pos = bt.find(anchor)
@@ -783,6 +830,23 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
                 del_num = int(hm.group(1))
             section_deletes.append((name, h, end, del_num))
             continue
+        if action == "multi_replace":
+            # 复合更正：value 为 [(old_sub, new_sub), ...]，对每个子串在其出现的
+            # 所有正文块内做替换（同词多块也要落全，避免只改第一处显得没改）
+            subs = value
+            for (old_sub, new_sub) in subs:
+                hits = [bid for bid, bt in btext.items() if old_sub in bt]
+                if not hits:
+                    unfound(quote, reply, f"复合更正：未找到「{old_sub}」", cmt)
+                    continue
+                for bid in hits:
+                    e = edits.setdefault(bid, {"original": btext[bid],
+                                               "new": btext[bid], "ops": []})
+                    key = ("replace", old_sub, new_sub)
+                    if not any(o[:3] == key for o in e["ops"]):
+                        e["ops"].append(("replace", old_sub, new_sub, note))
+            continue
+
         phrase = collapse_dup(quote) if action == "replace" else quote
         # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word
         if action in ("replace", "delete_word") and phrase:

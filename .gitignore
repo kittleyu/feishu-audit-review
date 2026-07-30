@@ -10,3 +10,4 @@ _diag_*.py
 _diag_*.txt
 preview_*.txt
 apply_*.txt
+*.bat
