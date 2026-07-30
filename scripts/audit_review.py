@@ -754,7 +754,11 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
                 if is_section_header(blocks[j]):
                     end = j
                     break
-            section_deletes.append((name, h, end))
+            del_num = None
+            hm = re.match(r"^(\d+)[.、．]", (extract_block_text(blocks[h]) or "").strip())
+            if hm:
+                del_num = int(hm.group(1))
+            section_deletes.append((name, h, end, del_num))
             continue
         phrase = collapse_dup(quote) if action == "replace" else quote
         # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word
@@ -910,6 +914,46 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
             for k in range(h, end):
                 print(f"       [{k}] {(extract_block_text(blocks[k]) or '')[:50]}")
 
+    # 删整节后重排后续同级编号标题（如删第2节后 3.→2.、4.→3.），避免留序号断档
+    deleted_nums = sorted({num for (_, _, _, num) in section_deletes if num})
+    if deleted_nums:
+        if do_apply:
+            blocks = get_doc_blocks(token, obj)   # 删除后刷新块列表
+        skip = set()
+        if not do_apply:   # 预览时未删，跳过将被删的标题块本身
+            for (_, hh, ee, _) in section_deletes:
+                skip.update(range(hh, ee))
+        for idx, b in enumerate(blocks):
+            if idx in skip:
+                continue
+            t = (extract_block_text(b) or "").strip()
+            m = re.match(r"^(\d+)([.、．])\s*\S", t)
+            if not m:
+                continue
+            old_num = int(m.group(1))
+            delta = sum(1 for dn in deleted_nums if dn < old_num)
+            if delta == 0:
+                continue
+            new_num = old_num - delta
+            new_text = str(new_num) + m.group(2) + t[m.end(2):]
+            if do_apply:
+                resp = update_block_text(token, obj, b.get("block_id"), new_text)
+                ok = resp.get("code") == 0
+                if ok:
+                    cur = {x.get("block_id"): extract_block_text(x) or ""
+                           for x in get_doc_blocks(token, obj)}
+                    ok = cur.get(b.get("block_id")) == new_text
+                if ok:
+                    rec = backup.setdefault(obj, {})
+                    rec.setdefault("__RENUMBER__", []).append(
+                        {"block_id": b.get("block_id"), "old_text": t, "new_text": new_text})
+                    print(f"  🔢 序号重排 #{old_num}→#{new_num}：{new_text[:40]}")
+                else:
+                    print(f"  ❌ 序号重排失败 #{old_num}→#{new_num} "
+                          f"code={resp.get('code')} {resp.get('msg')}")
+            else:
+                print(f"  🔍 [预览] 序号重排 #{old_num}→#{new_num}：{new_text[:40]}")
+
     for h in human:
         print(f"  👤 需人工: {h['note']} | 「{h['quote'][:24]}」→「{h['reply'][:24]}」")
     for ig in ignored:
@@ -996,6 +1040,18 @@ def cmd_restore(backup_file):
             if bid == "__SECTION__":   # 整节删除的备份（块已不存在，无法自动重建）
                 print(f"  ⏭️ 跳过整节删除备份 (obj={obj[:12]})：需按备份中的 "
                       f"deleted 文本手动重建被删块")
+                continue
+            if bid == "__RENUMBER__":   # 序号重排还原（撤销 --apply 的序号重排）
+                for rec in original:
+                    resp = update_block_text(token, obj, rec["block_id"], rec["old_text"])
+                    ok = resp.get("code") == 0
+                    if ok:
+                        cur = {x.get("block_id"): extract_block_text(x) or ""
+                               for x in get_doc_blocks(token, obj)}
+                        ok = cur.get(rec["block_id"]) == rec["old_text"]
+                    tag = "✅" if ok else "❌"
+                    print(f"  {tag} 还原序号重排 {rec['block_id'][:12]}…")
+                    total += 1
                 continue
             if bid == "__TITLE__":   # 标题还原（撤销 --apply 的标题改动）
                 resp = update_doc_title(token, obj, original)
