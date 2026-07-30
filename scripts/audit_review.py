@@ -617,6 +617,16 @@ def apply_edit(old, action, phrase, value):
             tmp = re.sub(re.escape(phrase) + r"[，。、；：]?", "", tmp)  # 删其余「最」
             tmp = tmp.replace("\x00", "最")                     # 还原保护
             return tmp if tmp.strip() else old
+        if phrase == "全":
+            # 单字「全」删除：仅删“全+自由名词”(全流程/全链条/全业务/全品种/全方位)，
+            # 保护固定词 全面/全部/完全/全权/全国/全覆盖
+            # （避免「全面结算会员」→「面结算会员」、「全部变量」→「部变量」式灾难）。
+            PROT = "面部完权国覆资"
+            tmp = re.sub(r"全([" + PROT + r"])",
+                         lambda m: "\uE000" + m.group(1), old)   # 占位保护固定词
+            tmp = re.sub(r"全[，。、；：]?", "", tmp)              # 删其余独立「全」
+            tmp = tmp.replace("\uE000", "全")                      # 还原保护词
+            return tmp if tmp.strip() else old
         # 删短语及其后一个常见标点（，。、；：），全替换
         new = re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
         return new if new.strip() else old   # 整块清空则回退
@@ -626,6 +636,19 @@ def apply_edit(old, action, phrase, value):
             # 仅「全品种」占位整词替换为「多品种」；保护「全面/全部/完全/全覆盖」等
             # （曾见正文 13 处「全面结算会员」被误改成「多品种面结算会员」的灾难性误伤）
             tmp = old.replace("全品种", "多品种")
+            return tmp if tmp.strip() else old
+        if phrase == "全" and value == "多方位":
+            # 审核把「全方位」里的「全」标成「多方位」，本意是「全方位」→「多方位」
+            tmp = old.replace("全方位", "多方位")
+            return tmp if tmp.strip() else old
+        if phrase == "全":
+            # 其余「全」→多/…：仅替换“全+自由名词”，保护固定词 全面/全部/完全/全权/全国/全覆盖
+            # （避免「全面结算会员」→「多面结算会员」、「全部变量」→「多部变量」）
+            PROT = "面部完权国覆资"
+            tmp = re.sub(r"全([" + PROT + r"])",
+                         lambda m: "\uE000" + m.group(1), old)   # 占位保护固定词
+            tmp = tmp.replace("全", value)                        # 替换其余独立「全」
+            tmp = tmp.replace("\uE000", "全")                      # 还原保护词
             return tmp if tmp.strip() else old
         if phrase == "最" and value == "较早":
             # 审核把「最早」里的「最」标成「较早」，本意是「最早」→「较早」
