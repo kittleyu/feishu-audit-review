@@ -298,6 +298,41 @@ def collapse_dup(text):
     return text
 
 
+# 章节/机构标题块类型（heading1..heading9）
+HEAD_TYPES = {3, 4, 5, 6, 7, 8, 9}
+
+
+def is_section_header(block):
+    """判断块是否为「章节/机构标题」（整节删除时用它定删除边界：
+    删到下一个标题块之前停止，避免误删后续不相关内容）。
+    判定：heading 类型块，或正文以「1. 」「2、」等编号开头。"""
+    if block.get("block_type") in HEAD_TYPES:
+        return True
+    t = (extract_block_text(block) or "").strip()
+    return bool(re.match(r"^\d+[\.、]\s*\S", t))
+
+
+def extract_inst_name(text):
+    """从评论 quote/reply 中抽取机构名作删除锚点。
+    优先取前导整段（到空格/句号前）若含机构后缀；否则全文搜第一个机构名。
+    覆盖：有限公司/有限责任公司/医院/诊所/门诊部/卫生所/医疗中心。
+    这样即使审核员手敲的描述口径与正文不同（正文用「该机构」等代称），
+    也能用机构名在正文定位到对应句子/整节。"""
+    if not text:
+        return None
+    # 1) 前导：取第一段（到首个空白/标点）若含机构后缀
+    m = re.match(r"\s*([\u4e00-\u9fa5]{2,}(?:有限责任公司|有限公司|医院|诊所|"
+                 r"门诊部|卫生所|医疗中心|中心))", text)
+    if m:
+        return m.group(1)
+    # 2) 全文搜第一个机构名（有限公司/有限责任公司 优先于 医院 等短后缀）
+    m = re.search(r"([\u4e00-\u9fa5]{2,}(?:有限责任公司|有限公司)|"
+                  r"[\u4e00-\u9fa5]{2,}(?:医院|诊所|门诊部|卫生所|医疗中心))", text)
+    if m:
+        return m.group(1)
+    return None
+
+
 def parse_suggest(r, q):
     """解析 改为/可改为/建议修改/建议改为 的替换值；
     多值（如「全流程」「全方位」→「多环节服务」「多领域合作」）按 quote 在
@@ -427,8 +462,11 @@ def classify(quote, reply):
     if "医疗保障承诺" in r or "医疗承诺" in r:
         return ("sentence_delete", q, f"违规承诺表述→整句删「{q}」")
 
-    # 9.7) 机构已注销/注销 → 删该机构虚假表述（标了就删，不替换成"已注销"四字）
+    # 9.7) 机构已注销/注销 → 删该机构整节（按机构名定位，描述口径不同也能命中）
     if "已注销" in r:
+        name = extract_inst_name(q) or extract_inst_name(r)
+        if name:
+            return ("delete_section", name, f"机构已注销→删整节「{name}」")
         return ("delete", None, f"机构已注销→删表述「{q}」")
 
     # 9.8) 动作标签（修改/格式规范/规范/调整/完善/整改/优化）无具体替换值 → 删短语
@@ -662,7 +700,7 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
     blocks = get_doc_blocks(token, obj)
     btext = {b.get("block_id"): extract_block_text(b) for b in blocks}
 
-    edits, human, ignored = {}, [], []
+    edits, human, ignored, section_deletes = {}, [], [], []
     def unfound(q, r, n, c):
         """找不到锚点时的处置：已点赞(用户已手动改)→忽略；否则→归人工。"""
         if is_comment_liked(c):
@@ -697,8 +735,26 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
                     e = edits.setdefault(bid, {"original": btext[bid],
                                                "new": btext[bid], "ops": []})
                     key = ("replace", tok, val)
-                    if not any(o[:3] == key for o in e["ops"]):
-                        e["ops"].append(("replace", tok, val, note))
+                if not any(o[:3] == key for o in e["ops"]):
+                    e["ops"].append(("replace", tok, val, note))
+            continue
+        if action == "delete_section":
+            # 整节删除：用机构名在根级块定位，删该块到下一个章节标题前
+            name = value
+            h = None
+            for idx, b in enumerate(blocks):
+                if name in (extract_block_text(b) or ""):
+                    h = idx
+                    break
+            if h is None:
+                unfound(quote, reply, f"删整节未找到「{name}」", cmt)
+                continue
+            end = len(blocks)
+            for j in range(h + 1, len(blocks)):
+                if is_section_header(blocks[j]):
+                    end = j
+                    break
+            section_deletes.append((name, h, end))
             continue
         phrase = collapse_dup(quote) if action == "replace" else quote
         # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word
@@ -824,6 +880,36 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
             else:
                 print(f"  🔍 [预览] 标题: 《{title}》→《{new_title}》")
 
+    # 整节删除（机构已注销等）：块级删除 [h, end)，按 h 降序保证下标有效
+    for name, h, end in sorted(set(section_deletes), key=lambda x: -x[1]):
+        if end <= h:
+            continue
+        if do_apply:
+            deleted = [blocks[k] for k in range(h, end)]
+            url = (f"https://open.feishu.cn/open-apis/docx/v1/documents/{obj}"
+                   f"/blocks/{obj}/children/batch_delete?document_revision_id=-1")
+            resp = api("DELETE", url, token, body={"start_index": h, "end_index": end})
+            if resp.get("code") == 0:
+                blocks2 = get_doc_blocks(token, obj)
+                full2 = "\n".join(extract_block_text(b) or "" for b in blocks2)
+                if name not in full2:
+                    rec = backup.setdefault(obj, {})
+                    rec.setdefault("__SECTION__", []).append({
+                        "name": name, "range": [h, end],
+                        "deleted": [{"block_id": b.get("block_id"),
+                                     "block_type": b.get("block_type"),
+                                     "text": extract_block_text(b) or ""}
+                                    for b in deleted]})
+                    print(f"  ✅ 删整节「{name}」 区间[{h},{end}) 共{end-h}块 校验一致")
+                else:
+                    print(f"  ❌ 删整节校验失败：删除后正文仍含「{name}」")
+            else:
+                print(f"  ❌ 删整节失败 code={resp.get('code')} {resp.get('msg')}")
+        else:
+            print(f"  🔍 [预览] 删整节「{name}」 区间[{h},{end}) 共{end-h}块:")
+            for k in range(h, end):
+                print(f"       [{k}] {(extract_block_text(blocks[k]) or '')[:50]}")
+
     for h in human:
         print(f"  👤 需人工: {h['note']} | 「{h['quote'][:24]}」→「{h['reply'][:24]}」")
     for ig in ignored:
@@ -907,6 +993,10 @@ def cmd_restore(backup_file):
     total = 0
     for obj, blocks in backup.items():
         for bid, original in blocks.items():
+            if bid == "__SECTION__":   # 整节删除的备份（块已不存在，无法自动重建）
+                print(f"  ⏭️ 跳过整节删除备份 (obj={obj[:12]})：需按备份中的 "
+                      f"deleted 文本手动重建被删块")
+                continue
             if bid == "__TITLE__":   # 标题还原（撤销 --apply 的标题改动）
                 resp = update_doc_title(token, obj, original)
                 ok = resp.get("code") == 0
