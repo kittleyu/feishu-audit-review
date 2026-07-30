@@ -363,7 +363,7 @@ def parse_suggest(r, q):
         else:
             v = vals[0]
     else:
-        v = after.strip().lstrip("—-").strip('。，、').strip('「"」"')
+        v = after.strip().lstrip("—-").strip('。，、').strip('「"」“”')
     if not v:
         return None
     # 二选一（"或者"/"或"）：取第一个，按评论直接改（审核给了任一可接受）
