@@ -991,7 +991,7 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
                 print(f"  🔍 [预览] 标题: 《{title}》→《{new_title}》")
 
     # 整节删除（机构已注销等）：块级删除 [h, end)，按 h 降序保证下标有效
-    for name, h, end in sorted(set(section_deletes), key=lambda x: -x[1]):
+    for name, h, end, _d in sorted(set(section_deletes), key=lambda x: -x[1]):
         if end <= h:
             continue
         if do_apply:
