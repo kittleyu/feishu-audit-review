@@ -500,6 +500,21 @@ def classify(quote, reply):
         newaddr = m.group(1).strip()
         return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
 
+    # 9.53) 地址不符更正：注册地址X与…实际主院区地址（Y）不符 → 地址 X→Y
+    #       审核用长说明指出旧地址错、正确地址在括号里；须早于 #10 兜底 replace
+    #       （否则整段说明会被当替换词写进正文）。仅替换地址部分，保留「注册地址为」等前缀。
+    if "不符" in r:
+        m_new = re.search(r"[（(]([^）)]{2,})[）)]", r)        # 括号里的正确地址
+        m_old = re.search(r"([\u4e00-\u9fa5]{2,}(?:省|市|区|县))?[\u4e00-\u9fa5]*(?:路|街道|街|号|大厦|广场|镇|乡)[^，。；]*", q)
+        if m_new and m_old:
+            olda = m_old.group(0).strip()
+            newa = m_new.group(1).strip()
+            m_city = re.match(r"([\u4e00-\u9fa5]{2,}省[\u4e00-\u9fa5]{2,}市)", olda)
+            city = m_city.group(1) if m_city else ""
+            new_full = q.replace(olda, city + newa)
+            if new_full != q:
+                return ("replace", new_full, f"地址更正「{olda}」→「{city}{newa}」")
+
     # 9.6) 医疗保障承诺类违规表述 → 整句删（不应替换成"医疗保障承诺"四字）
     if "医疗保障承诺" in r or "医疗承诺" in r:
         return ("sentence_delete", q, f"违规承诺表述→整句删「{q}」")
@@ -650,7 +665,11 @@ def apply_edit(old, action, phrase, value):
             # 残缺/无来源类：删除含定位片段(phrase)的整句
             kept = [s for s in split_sentences(old) if phrase not in s]
         new = "".join(kept)
-        return new if new.strip() else old   # 整块清空则回退（避免空块）
+        if new.strip():
+            return new
+        # 整块清空则回退：改为只删定位短语(及尾随标点)，避免违规承诺/绝对化词残留
+        fallback = re.sub(r"[，。、；：:]\s*$", "", old.replace(phrase, "")).strip()
+        return fallback if fallback else old
     if action == "delete_word":
         return old.replace(phrase, "")       # 全替换（同块/同词多出现都改）
     if action == "delete":
