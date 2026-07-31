@@ -64,16 +64,10 @@ def _load_credentials():
 APP_ID, APP_SECRET = _load_credentials()
 # 以下为使用者自己的飞书基础设施标识，建议通过环境变量覆盖（避免在公开仓库写死）
 SPACE_ID_GEO = os.environ.get("FEISHU_SPACE_ID_GEO", "7630734017544981692")   # GEO 文章空间（默认仅适配本机使用者，可改）
-RULES_BASE_APP = os.environ.get("FEISHU_RULES_BASE_APP", "Ys1AbSmgHaukF2sKUdQc8OlYnDd")  # 「优化客户管理」多维表 app_token
-RULES_TABLE = os.environ.get("FEISHU_RULES_TABLE", "客户维护规则")  # 管理表内存放客户维护规则的表名
 
 # 联系方式整句删除的触发词
 CONTACT_KW = ["客服热线", "400-", "热线", "电子邮箱", "@", "微信公众号",
               "微信号", "合规邮箱", "公众号", "联系方式", "咨询电话", "电话"]
-
-# 指令词（出现在回复里说明不是直接替换词）
-INSTRUCTION_KW = ["建议", "需", "请", "删除", "去掉", "不当", "绝对", "未查",
-                  "查及", "更名为", "来源"]
 
 
 # ====================== 飞书 API ======================
@@ -386,9 +380,34 @@ def normalize_date_cn(s):
     return s
 
 
+def _is_pure_replace_value(r):
+    """回复是否可作为『纯替换值』直接替换 quote。
+
+    这是「绝不乱加内容」的核心守卫：只有当回复足够短、无说明性标点、
+    无叙述连词/动词（即不像一段说明文字）时，才允许把它写进正文当替换值；
+    否则视为审核员的说明性文字，调用方应降级为「删 quote 短句」而不是写进正文。
+
+    例：'第一' / '雁塔西路277号' / '控股' 通过；
+        '注册地址X与…实际主院区地址（Y）不符' / '建议改为知名专家' 不通过。"""
+    if not r:
+        return False
+    if len(r) > 15:
+        return False
+    if any(p in r for p in "，。、；：！？\n\r\t（）()「」“”\""):
+        return False
+    # 叙述性连词/动词，暗示这是一段说明而非替换词
+    if any(w in r for w in ("不符", "显示", "根据", "位于", "为", "系", "即",
+                            "因", "由", "经", "称", "说明", "实际", "应为",
+                            "与", "和", "但", "故", "建议", "需", "请")):
+        return False
+    return True
+
+
 def classify(quote, reply):
     """返回 (action, value, note); action ∈
-       {replace, delete, delete_word, sentence_delete, xx_replace, human}"""
+       {replace, delete, delete_word, sentence_delete, xx_replace, delete_section, multi_replace, human}
+       唯一规则：按评论修改；拿不准就把 quote 那段短句删掉；绝不把回复里的说明性
+       文字当正文写进去（不乱加内容）。"""
     q = quote.strip()
     r = reply.strip()
     if not q:
@@ -482,8 +501,10 @@ def classify(quote, reply):
     if "绝对化" in r or "绝对" in r:
         return ("delete", None, f"绝对化删词「{q}」")
 
-    # 8) 无法核实 / 有待核实（如某家待核实、整家删除等）→ 人工
-    if any(k in r for k in ("有待核实", "核实", "未查及", "未查", "公开平台未查",
+    # 8) 无法核实 / 未查及（结构性，删整段/整家不确定）→ 人工
+    #    仅匹配「无法核实/有待核实/未查及」等"无法确认"语义；不含单独的"核实"
+    #    （如"经核实正确地址应为X"是已给新值的更正，不该归人工，应走更正/删短句）。
+    if any(k in r for k in ("有待核实", "无法核实", "未查及", "未查", "公开平台未查",
                             "未能验证", "无法验证")):
         return ("human", None, f"无法核实，需人工决定：{r}")
 
@@ -533,16 +554,18 @@ def classify(quote, reply):
             or r.strip() in ("修改", "规范", "规范表述"):
         return ("delete", None, f"动作标签「{r}」→删短语「{q}」")
 
-    # 10) 干净替换词（无指令词）→ 覆盖 靠前→第一、全X→多X、靠前家→前列的、
-    #     资质替换、直接给替换值(如 AAA 统一更正「2019年期货行业首家取得…」) 等
+    # 10) 回复无指令词：判断是否可作为『纯替换值』
+    #     纯值（短、无说明性标点/叙述词）→ replace quote→reply
+    #     非纯值（说明性长文/句子）→ 降级为删 quote 短句（绝不乱加内容）
     if not any(kw in r for kw in ("建议", "需", "请")):
-        return ("replace", r, f"「{q}」→「{r}」")
+        if _is_pure_replace_value(r):
+            return ("replace", r, f"「{q}」→「{r}」")
+        return ("delete", None, f"回复非纯替换值→删短语「{q}」")
 
-    # 11) 长文语义纠正（>25字，无明确替换词）→ 人工（兜底，防把长指令当替换）
+    # 11) 兜底：长文/模糊指令一律删 quote 短句（拿不准就删，不归人工、不乱加）
     if len(r) > 25:
-        return ("human", None, f"长文语义纠正，需人工：{r[:30]}…")
-
-    return ("human", None, f"模糊指令：{r}")
+        return ("delete", None, f"拿不准→删短语「{q}」")
+    return ("delete", None, f"拿不准→删短语「{q}」")
 
 
 def split_sentences(text):
@@ -601,9 +624,13 @@ def locate_long_delete(phrase, btext):
     return None, None
 
 
-# 长替换短语的合法结束词（用于补尾：评论 quote 被截断时，按正文实际词收尾）
-REPLACE_END_WORDS = ["期货公司", "期货机构", "期货经营机构",
-                     "有限公司", "股份有限公司", "证券公司", "证券机构"]
+# 长短语替换的合法结束词（用于补尾：评论 quote 被截断时，按正文实际词收尾）。
+# 常识机构/公司后缀，按长度降序匹配优先长后缀（避免「有限公司」抢匹配「有限责任公司」）。
+REPLACE_END_WORDS = ["有限责任公司", "股份有限公司", "有限公司", "股份公司",
+                     "医院", "诊所", "门诊部", "卫生院", "医疗中心", "中心医院",
+                     "证券公司", "证券机构", "期货公司", "期货机构", "基金公司",
+                     "保险公司", "信托公司", "财务公司", "科技公司", "研究中心",
+                     "研究院", "事务所", "集团", "银行", "学校", "大学"]
 
 
 def locate_long_replace(phrase, btext, value):
@@ -618,15 +645,15 @@ def locate_long_replace(phrase, btext, value):
     for bid, bt in btext.items():
         pos = bt.find(anchor)
         if pos >= 0:
-            best = None
+            best = None  # (w_len, cand) 优先最长后缀，避免「有限公司」抢匹配「有限责任公司」
             for w in REPLACE_END_WORDS:
                 ep = bt.find(w, pos)
                 if ep >= 0:
                     cand = ep + len(w)
-                    if best is None or cand < best:
-                        best = cand
+                    if best is None or len(w) > best[0]:
+                        best = (len(w), cand)
             if best:
-                return bid, bt[pos:best]
+                return bid, bt[pos:best[1]]
             # 退化：延伸到句末
             end = pos + len(phrase)
             while end < len(bt) and bt[end] not in "。！？；\n":
@@ -639,18 +666,23 @@ def locate_long_replace(phrase, btext, value):
     return None, None
 
 
+# 常识机构/公司后缀（用于匿名化保留行业区分，非客户专属）
+_INST_SUFFIXES = ("有限责任公司", "股份有限公司", "有限公司", "股份公司",
+                  "医院", "诊所", "门诊部", "卫生院", "医疗中心", "中心医院",
+                  "集团", "银行", "证券公司", "证券机构", "期货公司", "期货机构",
+                  "基金公司", "保险公司", "信托公司", "财务公司", "科技公司",
+                  "研究中心", "研究院", "事务所", "学校", "大学")
+
+
 def xxify(token):
-    """具体公司/机构名匿名化：xx + 行业后缀。
-    例：「某钢铁公司」→xx钢铁、「某股份公司」→xx、「某期货公司」→xx期货。"""
+    """具体公司/机构名匿名化：xx + 末尾常识机构后缀（用于保留行业区分）。
+    纯通用、不写死任何具体行业/客户：后缀从 token 自身推断。
+    例：「某钢铁公司」→xx公司、「某期货公司」→xx期货、「西安某医院」→xx医院。"""
     t = token.strip()
     if not t:
         return "xx"
-    if "钢铁" in t or t.endswith("钢"):
-        return "xx钢铁"
-    if "股份" in t:
-        return "xx"
-    for suf in ("期货", "证券", "银行", "保险", "基金"):
-        if suf in t:
+    for suf in _INST_SUFFIXES:
+        if t.endswith(suf):
             return "xx" + suf
     return "xx"
 
@@ -741,49 +773,7 @@ def discover_dir(token, node_token):
     return docs
 
 
-def load_client_rules_from_base(token, client):
-    """从「优化客户管理」多维表读某客户的维护规则，返回 [(action, phrase, value, note)]。
-    规则类型(单选): 替换/删短语/删词/整句删 → replace/delete/delete_word/sentence_delete。
-    无「客户维护规则」表或无该客户规则时返回 []（不报错）。"""
-    t = api("GET", f"https://open.feishu.cn/open-apis/bitable/v1/apps/{RULES_BASE_APP}/tables", token)
-    tid = None
-    for tb in (t.get("data") or {}).get("tables", []):
-        if tb.get("name") == RULES_TABLE:
-            tid = tb.get("table_id")
-            break
-    if not tid:
-        print(f"  [WARN] 管理表中未找到「{RULES_TABLE}」表，跳过客户规则套用")
-        return []
-    out = []
-    pt = None
-    for _ in range(20):
-        params = {"page_size": 100}
-        if pt:
-            params["page_token"] = pt
-        r = api("GET",
-                f"https://open.feishu.cn/open-apis/bitable/v1/apps/{RULES_BASE_APP}/tables/{tid}/records",
-                token, params=params)
-        for rec in (r.get("data") or {}).get("items", []):
-            f = rec.get("fields", {})
-            if (f.get("客户名") or "").strip() != client:
-                continue
-            rt = f.get("规则类型") or {}
-            rtype = rt.get("text") if isinstance(rt, dict) else rt
-            phrase = (f.get("查找内容") or "").strip()
-            value = (f.get("替换为") or "").strip()
-            note = (f.get("备注") or "").strip()
-            action = {"替换": "replace", "删短语": "delete",
-                      "删词": "delete_word", "整句删": "sentence_delete"}.get(rtype)
-            if action and phrase:
-                out.append((action, phrase, value, note or f"规则[{rtype}]"))
-        d = r.get("data") or {}
-        if not d.get("has_more"):
-            break
-        pt = d.get("page_token")
-    return out
-
-
-def process_article(token, art, do_apply, backup, extra_rules=None):
+def process_article(token, art, do_apply, backup):
     obj = art["obj"]
     comments = art["comments"]
     blocks = get_doc_blocks(token, obj)
@@ -900,34 +890,6 @@ def process_article(token, art, do_apply, backup, extra_rules=None):
             key = (action, phrase, value)
             if not any(o[:3] == key for o in e["ops"]):
                 e["ops"].append((action, phrase, value, note))
-
-    # 机会4：叠加客户维护规则（来自管理表多维表，无论有无评论都套用）
-    if extra_rules:
-        for (action, phrase, value, note) in extra_rules:
-            if not phrase:
-                continue
-            if action in ("replace", "delete_word"):
-                title_candidates.append((action, phrase, value, note))
-            hit = [bid for bid, bt in btext.items() if phrase in bt]
-            if not hit:
-                if action == "delete" and len(phrase) > 15:
-                    bid2, frag = locate_long_delete(phrase, btext)
-                    if bid2 and frag:
-                        hit, phrase = [bid2], frag
-                if not hit and len(phrase) <= 15:
-                    fphrase = fuzzy_locate(phrase, btext)
-                    if fphrase and fphrase != phrase:
-                        hit = [bid for bid, bt in btext.items() if fphrase in bt]
-                        phrase = fphrase
-                if not hit:
-                    print(f"  👤 规则未命中: {note} | 「{phrase[:24]}」")
-                    continue
-            for bid in hit:
-                e = edits.setdefault(bid, {"original": btext[bid],
-                                           "new": btext[bid], "ops": []})
-                key = (action, phrase, value)
-                if not any(o[:3] == key for o in e["ops"]):
-                    e["ops"].append((action, phrase, value, note))
 
     for bid, e in edits.items():
         new = e["original"]
@@ -1084,7 +1046,7 @@ def cmd_probe(dir_node, from_index=None):
             print(f"   💬 「{p['quote'][:40]}」 → {rep}")
 
 
-def cmd_review(dir_node, do_apply, from_index=None, client_rules=None):
+def cmd_review(dir_node, do_apply, from_index=None):
     token = get_token()
     docs = discover_dir(token, dir_node)
     if from_index is not None:
@@ -1096,7 +1058,7 @@ def cmd_review(dir_node, do_apply, from_index=None, client_rules=None):
     tot_h = tot_ig = 0
     for d in wc:
         print(f"\n{'='*66}\n[{d['i']}] 《{d['title'][:40]}》\n{'='*66}")
-        h, ig = process_article(token, d, do_apply, backup, extra_rules=client_rules)
+        h, ig = process_article(token, d, do_apply, backup)
         tot_h += h
         tot_ig += ig
     if do_apply and backup:
@@ -1189,8 +1151,6 @@ def main():
     fix_title = "--fix-title" in args
     restore = "--restore" in args
     from_index = None
-    rules_from_base = "--rules-from-base" in args
-    client = None
     obj = newt = None   # --fix-title 的目标 obj / 新标题（循环内赋值）
 
     for j, a in enumerate(args):
@@ -1204,8 +1164,6 @@ def main():
         if a == "--fix-title":
             obj = args[j + 1] if j + 1 < len(args) else None
             newt = args[j + 2] if j + 2 < len(args) else None
-        if a == "--client" and j + 1 < len(args):
-            client = args[j + 1]
 
     if restore:
         # --restore <file>
@@ -1232,14 +1190,7 @@ def main():
         return cmd_titles(dir_node, from_index)
     if probe:
         return cmd_probe(dir_node, from_index)
-    client_rules = None
-    if rules_from_base:
-        if not client:
-            print("用法: --rules-from-base 需配合 --client <客户名>，例如 --rules-from-base --client 某客户")
-            sys.exit(1)
-        client_rules = load_client_rules_from_base(get_token(), client)
-        print(f"📋 从管理表载入「{client}」维护规则 {len(client_rules)} 条")
-    return cmd_review(dir_node, do_apply, from_index, client_rules=client_rules)
+    return cmd_review(dir_node, do_apply, from_index)
 
 
 if __name__ == "__main__":
