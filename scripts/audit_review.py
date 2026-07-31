@@ -403,17 +403,32 @@ def _is_pure_replace_value(r):
     return True
 
 
+# 审核确认类回复（无修改指令，应跳过而非替换/删除）：回复去掉尾标点后完全匹配其一
+_CONFIRM_TOKENS = {
+    "已确认", "确认", "确认无误", "无需修改", "无需更改", "不需要修改",
+    "没问题", "无误", "内容无误", "正确无误", "已核实", "经核实无误",
+    "同意", "无异议", "已阅", "阅", "无问题",
+}
+
+
 def classify(quote, reply):
     """返回 (action, value, note); action ∈
-       {replace, delete, delete_word, sentence_delete, xx_replace, delete_section, multi_replace, human}
+       {skip, replace, delete, delete_word, sentence_delete, xx_replace, delete_section, multi_replace, human}
        唯一规则：按评论修改；拿不准就把 quote 那段短句删掉；绝不把回复里的说明性
-       文字当正文写进去（不乱加内容）。"""
+       文字当正文写进去（不乱加内容）。skip = 审核确认无误，保持原样不改动。"""
     q = quote.strip()
     r = reply.strip()
     if not q:
         return ("human", None, "无 quote")
     if not r:
         return ("human", None, "无回复/替换词")
+
+    # 0) 审核确认无误（回复是确认类、无修改指令）→ 跳过：不替换、不删除、不归人工。
+    #    把「已确认」当替换值写进正文是灾难（既破坏原意又违反「不乱加内容」）；
+    #    删除已确认正确的内容同样有害。安全做法是保持原样，交由审核人员后续处理。
+    rr = r.rstrip("。.！!？?；;，,、")
+    if (len(rr) <= 10 and rr in _CONFIRM_TOKENS) or rr.lower() in ("ok", "ok.", "yes", "no change", "confirmed"):
+        return ("skip", None, f"审核已确认无误，跳过：{r}")
 
     # 1) 联系方式 -> 整句删除（按 。！？； 切句，删含联系渠道关键词的句子）
     if "联系方式" in r:
@@ -793,6 +808,9 @@ def process_article(token, art, do_apply, backup):
         quote = (p.get("quote") or "").strip()
         reply = p["replies"][-1]["text"].strip() if p["replies"] else ""
         action, value, note = classify(quote, reply)
+        if action == "skip":
+            # 审核已确认无误，保持原样，不计入人工/忽略
+            continue
         if action == "human":
             human.append({"quote": quote, "reply": reply, "note": note})
             continue
