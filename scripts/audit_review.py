@@ -423,6 +423,10 @@ def classify(quote, reply):
     if not q:
         return ("human", None, "无 quote")
     if not r:
+        # 空回复：仅高亮了 quote（多为错误地址标注）。若 quote 像地址 → 删该错误地址短语；
+        # 否则无法安全处理 → 人工。
+        if re.search(r"(?:位于|路|号|区|省|市|地址)", q):
+            return ("delete", None, f"空回复·删错误地址「{q}」")
         return ("human", None, "无回复/替换词")
 
     # 0) 审核确认无误（回复是确认类、无修改指令）→ 跳过：不替换、不删除、不归人工。
@@ -538,6 +542,25 @@ def classify(quote, reply):
         newaddr = m.group(1).strip()
         return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
 
+    # 9.52) 地址更正（实际位于 X / X 为 YY 地址）：抽正确地址替换 quote 中的错误地址
+    #   审核回复指出旧地址错、给出实际地址，如"唐都医院实际位于西安市灞桥区新寺路1号"，
+    #   或"长乐西路127号为西京医院地址，唐都医院实际位于西安市灞桥区新寺路1号"。
+    #   须早于 #10 兜底 replace（否则整段说明会被当替换值写进正文）。仅替换地址部分，
+    #   保留「位于/际地址位于/实际地址位于」等前缀。
+    m_real = re.search(r"(?:实际)?位于([^，。；]+)", r)
+    if not m_real:
+        m_real = re.search(r"([\u4e00-\u9fa5]{2,}市[\u4e00-\u9fa5]{1,3}(?:区|县)"
+                           r"[\u4e00-\u9fa5\d]*(?:路|街|号)+[\u4e00-\u9fa5\d]*)", r)
+    if m_real:
+        newa = m_real.group(1).strip().rstrip("；;。、")
+        m_old = re.search(r"([\u4e00-\u9fa5]{2,}(?:省|市|区|县))?[\u4e00-\u9fa5\d]*"
+                           r"(?:路|街道|街|号|大厦|广场|镇|乡)[\u4e00-\u9fa5\d]*", q)
+        if m_old and m_old.group(0).strip() in q:
+            olda = m_old.group(0).strip()
+            new_full = q.replace(olda, newa)
+            if new_full != q:
+                return ("replace", new_full, f"地址更正「{olda}」→「{newa}」")
+
     # 9.53) 地址不符更正：注册地址X与…实际主院区地址（Y）不符 → 地址 X→Y
     #       审核用长说明指出旧地址错、正确地址在括号里；须早于 #10 兜底 replace
     #       （否则整段说明会被当替换词写进正文）。仅替换地址部分，保留「注册地址为」等前缀。
@@ -563,6 +586,13 @@ def classify(quote, reply):
         if name:
             return ("delete_section", name, f"机构已注销→删整节「{name}」")
         return ("delete", None, f"机构已注销→删表述「{q}」")
+
+    # 9.71) 卫健委无结果（查无此机构）→ 删该机构整节（与机构已注销同等处理）
+    if "卫健委无结果" in r or "卫健委无" in r:
+        name = extract_inst_name(q) or extract_inst_name(r)
+        if name:
+            return ("delete_section", name, f"卫健委无结果→删整节「{name}」")
+        return ("delete", None, f"卫健委无结果→删表述「{q}」")
 
     # 9.8) 动作标签（修改/格式规范/规范/调整/完善/整改/优化）无具体替换值 → 删短语
     #      审核给的是「动作指令」而非替换词；若当成替换值会把正文替换成
