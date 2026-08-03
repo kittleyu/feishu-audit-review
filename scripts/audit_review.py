@@ -744,7 +744,15 @@ def apply_edit(old, action, phrase, value):
             return tmp if tmp.strip() else old
         # 删短语及其后一个常见标点（，。、；：），全替换
         new = re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
-        return new if new.strip() else old   # 整块清空则回退
+        if not new.strip():
+            # 评论要删的整段几乎就是整块全部内容 → 标记删除整块（不再保留空块）
+            residual = old.replace(phrase, "").strip()
+            if len(residual) <= 1:
+                return ""                      # 空标记：process_article 将删除该 block
+            # 否则回退只删定位短语（保留其他内容，避免误删整块）
+            fallback = re.sub(r"[，。、；：:]\s*$", "", residual).strip()
+            return fallback if fallback else old
+        return new
     if action == "replace" and len(phrase) == 1:
         # 单字替换为多字 value：整词感知，避免无差别替换破坏正文复合词
         if phrase == "全" and "多品种" in value:
@@ -797,6 +805,7 @@ def process_article(token, art, do_apply, backup):
     btext = {b.get("block_id"): extract_block_text(b) for b in blocks}
 
     edits, human, ignored, section_deletes = {}, [], [], []
+    block_deletes = {}   # delete 动作导致整块清空 → 真正删除该 block
     def unfound(q, r, n, c):
         """找不到锚点时的处置：已点赞(用户已手动改)→忽略；否则→归人工。"""
         if is_comment_liked(c):
@@ -918,6 +927,10 @@ def process_article(token, art, do_apply, backup):
         for a, ph, v, _ in sorted(e["ops"], key=lambda x: -len(x[1])):
             new = apply_edit(new, a, ph, v)
         e["new"] = new
+        if new == "":
+            block_deletes[bid] = e["original"]
+            print(f"  🗑️ 整块删除(评论要求删整段) 块 {bid[:12]}…")
+            continue
         if new == e["original"]:
             print(f"  ⏭️ 块 {bid[:12]}… 编辑后无变化")
             continue
@@ -1041,6 +1054,35 @@ def process_article(token, art, do_apply, backup):
                           f"code={resp.get('code')} {resp.get('msg')}")
             else:
                 print(f"  🔍 [预览] 序号重排 #{old_num}→#{new_num}：{new_text[:40]}")
+
+    # 整块删除（delete 动作导致整块清空，评论要求删整段）：真正删除该 block
+    if block_deletes:
+        blocks_now = get_doc_blocks(token, obj) if do_apply else blocks
+        idx_now = {b.get("block_id"): i for i, b in enumerate(blocks_now)}
+        for bid in sorted(set(block_deletes), key=lambda b: -idx_now.get(b, 0)):
+            orig = block_deletes[bid]
+            if do_apply:
+                i = idx_now.get(bid)
+                if i is None:
+                    print(f"  ⚠️ 删整块找不到下标 块 {bid[:12]}")
+                    continue
+                url = (f"https://open.feishu.cn/open-apis/docx/v1/documents/{obj}"
+                       f"/blocks/{obj}/children/batch_delete?document_revision_id=-1")
+                resp = api("DELETE", url, token, body={"start_index": i, "end_index": i + 1})
+                if resp.get("code") == 0:
+                    blocks2 = get_doc_blocks(token, obj)
+                    if not any(x.get("block_id") == bid for x in blocks2):
+                        backup.setdefault(obj, {})[bid] = orig
+                        print(f"  ✅ 删整块 块 {bid[:12]}… 校验一致")
+                        blocks_now = blocks2
+                        idx_now = {b.get("block_id"): i2
+                                   for i2, b in enumerate(blocks2)}
+                    else:
+                        print(f"  ❌ 删整块校验失败 块 {bid[:12]}")
+                else:
+                    print(f"  ❌ 删整块失败 code={resp.get('code')} {resp.get('msg')}")
+            else:
+                print(f"  🔍 [预览] 删整块 块 {bid[:12]}…")
 
     for h in human:
         print(f"  👤 需人工: {h['note']} | 「{h['quote'][:24]}」→「{h['reply'][:24]}」")
