@@ -601,6 +601,31 @@ def classify(quote, reply):
             or r.strip() in ("修改", "规范", "规范表述"):
         return ("delete", None, f"动作标签「{r}」→删短语「{q}」")
 
+    # 9.4) 「靠前家」→ 前列的/较早的/第一 等（审核常把"行业靠前家"标成"行业前列的"；
+    #       长句评论如「行业靠前家上市公司，也是山东省靠前家金融类」→「靠前——行业前列的」
+    #       也是同一意图：把"靠前家"改成"前列的"。统一按"靠前家"锚点替换，避免整段误替/误删。
+    #       不影响「靠前步/靠前笔/靠前个/靠前」等其它"靠前"修正。
+    if "靠前家" in q:
+        if "前列" in r:
+            return ("multi_replace", [("靠前家", "前列的")], "靠前家→前列的")
+        if "较早" in r:
+            return ("multi_replace", [("靠前家", "较早的")], "靠前家→较早的")
+        if "第一" in r:
+            return ("multi_replace", [("靠前家", "第一")], "靠前家→第一")
+
+    # 9.9) 「全X、全Y」→「多X、多Y」类并列更正：审核把一列"全XX"改成"多XX"
+    #       （如 全品种、全业务链 → 多品种、多业务）。按位置映射逐子串替换，
+    #       不整段删除（铁律：审核已给明确替换口径，必须按评论执行，不能过度保护）。
+    if ("、" in q) and ("、" in r):
+        qp = [x.strip() for x in q.split("、")]
+        rp = [x.strip() for x in r.split("、")]
+        if len(qp) == len(rp) and len(qp) >= 2 \
+                and all(p.startswith("全") for p in qp) \
+                and all(p.startswith("多") for p in rp) \
+                and all(a in q for a, _ in zip(qp, rp)):
+            subs = [(a, b) for a, b in zip(qp, rp)]
+            return ("multi_replace", subs, f"全→多并列替换{subs}")
+
     # 10) 回复无指令词：判断是否可作为『纯替换值』
     #     纯值（短、无说明性标点/叙述词）→ replace quote→reply
     #     非纯值（说明性长文/句子）→ 降级为删 quote 短句（绝不乱加内容）
