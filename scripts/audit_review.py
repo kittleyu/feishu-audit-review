@@ -630,11 +630,15 @@ def classify(quote, reply):
         return ("sentence_delete", q, f"违规承诺表述→整句删「{q}」")
 
     # 9.7) 机构已注销/注销 → 删该机构整节（按机构名定位，描述口径不同也能命中）
-    if "已注销" in r:
-        name = extract_inst_name(q) or extract_inst_name(r)
+    #    注意「已于2025年9月10日注销」这类把「已」与「注销」用日期隔开的变体，
+    #    故用「注销」而非「已注销」做关键词（前者完全覆盖后者）。
+    if "注销" in r:
+        name = extract_inst_name(q)
         if name:
             return ("delete_section", name, f"机构已注销→删整节「{name}」")
-        return ("delete", None, f"机构已注销→删表述「{q}」")
+        # q 抽不到机构全名（如只高亮「公司」两字）→ 无法可靠定位正文机构整节，
+        # 归人工，绝不拿 reply 里的分公司名当正文机构名去误删。
+        return ("human", None, f"注销但 quote 未含机构全名，无法定位整节：{r}")
 
     # 9.71) 卫健委无结果（查无此机构）→ 删该机构整节（与机构已注销同等处理）
     if "卫健委无结果" in r or "卫健委无" in r:
