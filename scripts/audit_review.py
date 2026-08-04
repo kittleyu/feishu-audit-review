@@ -436,6 +436,34 @@ def classify(quote, reply):
     if (len(rr) <= 10 and rr in _CONFIRM_TOKENS) or rr.lower() in ("ok", "ok.", "yes", "no change", "confirmed"):
         return ("skip", None, f"审核已确认无误，跳过：{r}")
 
+    # 0.7) 审核「问题类型标注」识别：回复是审核给的批注标签（绝对化用语 / 金融保障承诺 /
+    #      无限定承诺 / 表达不通顺 / 文字笔误 / 不得涉及电话 / 拆分矛盾表述 等），
+    #      **不是替换值**。绝不能把标签文字写进正文（如把「安全」改成「金融保障承诺」、
+    #      把号码改成「不得涉及电话」）。按标签语义处理：删短语 / 抽笔误替换 / 归人工。
+    #      注意：刻意不含「事实性错误 / 荣誉归属错误 / 数据错误」——那类走 #6.5 建议改为
+    #      已能正确 replace（如「建议改为旗下全资子公司永安资本…」），此处若拦截会破坏之。
+    _LABEL_KW = ("绝对化用语", "绝对化承诺", "无限定承诺", "金融保障承诺",
+                 "表达不通顺", "不通顺", "语句不通",
+                 "文字笔误", "笔误", "不得涉及电话", "涉电话", "拆分矛盾表述")
+    if any(k in r for k in _LABEL_KW):
+        # 笔误：抽 「X」应为「Y」/ "X"应为"Y" → 替换错别字（保留原句其余内容）
+        m = re.search(r'[""\'「]?([^""\'「」]{1,8})[""\'「]?\s*应为\s*[""\'「]?([^""\'「」]{1,8})[""\'「]?', r)
+        if m and "笔误" in r:
+            # 返回「修正后的整句」作为 value（process_article 用 quote 作 phrase 整体替换），
+            # 绝不能把 group1(旧词) 当 value——否则整句会被替换成旧词本身（灾难）。
+            new_q = q.replace(m.group(1), m.group(2))
+            if new_q != q:
+                return ("replace", new_q, f"笔误「{m.group(1)}」→「{m.group(2)}」")
+        if "拆分" in r:
+            return ("human", None, f"拆分矛盾表述需重写：{r}")
+        # 其余纯标签（绝对化/承诺/不通顺/涉电话等）→ 删 quote 短语（拿不准删短句）
+        return ("delete", None, f"删短语（批注「{r}」）「{q}」")
+
+    # 0.8) 补注时间类（如「首批」经核实为真需补注时间（2011年））→ 归人工，
+    #      不要整句误删（审核本意是补注而非删除）。
+    if "补注时间" in r or "经核实为真" in r:
+        return ("human", None, f"需补注时间：{r}")
+
     # 1) 联系方式 -> 整句删除（按 。！？； 切句，删含联系渠道关键词的句子）
     if "联系方式" in r:
         return ("sentence_delete", None, "联系方式→整句删除")
@@ -577,7 +605,7 @@ def classify(quote, reply):
                 return ("replace", new_full, f"地址更正「{olda}」→「{city}{newa}」")
 
     # 9.6) 医疗保障承诺类违规表述 → 整句删（不应替换成"医疗保障承诺"四字）
-    if "医疗保障承诺" in r or "医疗承诺" in r:
+    if "医疗保障承诺" in r or "医疗承诺" in r or "保障承诺" in r:
         return ("sentence_delete", q, f"违规承诺表述→整句删「{q}」")
 
     # 9.7) 机构已注销/注销 → 删该机构整节（按机构名定位，描述口径不同也能命中）
