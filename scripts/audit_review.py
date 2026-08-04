@@ -343,7 +343,7 @@ def parse_suggest(r, q):
     # 必须锚定「建议改为/建议修改为/改为/可改为」标记，只从标记后取值；
     # 否则 (.+) 会从位置0贪婪捕获整句，把列举词(全流程/全方位)也卷进 vals，
     # 导致 vals[0] 取到「全流程」自己而非建议值。
-    m = re.search(r'(?:建议修改(?:为)?|建议改为|可\s*改为|改为)[：:]?\s*-*\s*', r)
+    m = re.search(r'(?:建议修改(?:为)?|建议改为|可\s*改为|更正为|需更正为|改为)[：:]?\s*-*\s*', r)
     if not m:
         return None
     after = r[m.end():]
@@ -554,6 +554,19 @@ def classify(quote, reply):
     if sv:
         return ("replace", sv, f"「{q}」→「{sv}」(改为)")
 
+    # 6.55) 双重否定/多字修正：审核指出 quote 含多余的「不」导致语义反转
+    #       （如「不不对」→「不对」、「不会向投资者不对」→「不会向投资者对」、
+    #        「"不对…"前多了"不"字」），需删掉多余的一个「不」使语义正确。
+    #        触发：回复含「双重否定」或「多了…不…字」；且 quote 实际含 ≥2 个「不」。
+    #        修正：删掉 quote 中**第二个**「不」（这些双重否定都是「不…不…」，
+    #        删第二个「不」即得正确语义；删第一个会反转，故取第二个）。
+    if (("双重否定" in r) or ("多了" in r and "不" in r)) and q.count("不") >= 2:
+        idxs = [i for i, ch in enumerate(q) if ch == "不"]
+        second = idxs[1]
+        new_q = q[:second] + q[second + 1:]
+        if new_q != q and new_q.strip():
+            return ("replace", new_q, f"双重否定/多字修正「{q}」→「{new_q}」")
+
     # 7) 绝对化用语/用词/承诺（无替换词）→ 删整个 quote（去绝对化，全部接受）
     if "绝对化" in r or "绝对" in r:
         return ("delete", None, f"绝对化删词「{q}」")
@@ -677,6 +690,10 @@ def classify(quote, reply):
             return ("replace", "多", "全→多（复合词感知）")
         if "删除" in r:
             return ("delete", None, "删单字全（复合词感知）")
+        # 其他回复：若回复是纯替换值（短、无说明性标点/连词），按值替换
+        # （如「全」→「完整交易周期」）；否则拿不准→删该短语（锚定块内），绝不无差别替换。
+        if _is_pure_replace_value(r):
+            return ("replace", r, f"单字全→「{r}」（锚定块内替换）")
         return ("delete", None, f"单字全→删短语「{q}」（{r}）")
 
     # 10) 回复无指令词：判断是否可作为『纯替换值』
