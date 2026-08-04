@@ -53,6 +53,10 @@ CASES = [
     ("审核确认无误-此处不作修改", "最准确", "此处不作修改", "skip", None),
     ("审核确认无误-不作修改", "某段", "不作修改", "skip", None),
     ("审核确认无误-不修改", "某段", "不修改", "skip", None),
+    # 补注时间类：抽引号术语 + 年份，增补为「术语（YYYY年）」，不乱删不乱写
+    ("补注时间", "永安期货是国内首批获得期货投资咨询业务资格的机构；",
+     '"首批"绝对化经核实为真需补注时间（2011 年）', "multi_replace", "首批（2011年）"),
+    ("补注时间无年份归人工", "某句", "经核实为真需补注时间", "human", None),
 ]
 
 
@@ -62,7 +66,7 @@ def main():
         act, val, note = A.classify(q, r)
         ok = (act == exp_act)
         if exp_val is not None:
-            ok = ok and (exp_val in (val or ""))
+            ok = ok and (exp_val in str(val))
         tag = "PASS" if ok else "FAIL"
         if not ok:
             fails += 1

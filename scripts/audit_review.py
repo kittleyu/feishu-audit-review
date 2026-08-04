@@ -459,10 +459,18 @@ def classify(quote, reply):
         # 其余纯标签（绝对化/承诺/不通顺/涉电话等）→ 删 quote 短语（拿不准删短句）
         return ("delete", None, f"删短语（批注「{r}」）「{q}」")
 
-    # 0.8) 补注时间类（如「首批」经核实为真需补注时间（2011年））→ 归人工，
-    #      不要整句误删（审核本意是补注而非删除）。
+    # 0.8) 补注时间类（如「首批」经核实为真需补注时间（2011年））→ 真正补注：
+    #      抽回复里被引号包裹的术语（如「首批」）+ 年份（YYYY年），把该术语增补为
+    #      「术语（YYYY年）」。审核本意是补注而非删除/改写，故用 multi_replace 只动该词。
+    #      若无法解析出口径（缺术语或年份）→ 仍归人工，绝不乱加内容。
     if "补注时间" in r or "经核实为真" in r:
-        return ("human", None, f"需补注时间：{r}")
+        my = re.search(r"(\d{4})\s*年", r)
+        mt = re.search(r'[""「]([^""「」]{1,6})[""」]', r)
+        if my and mt:
+            term, year = mt.group(1), my.group(1)
+            return ("multi_replace", [(term, f"{term}（{year}年）")],
+                    f"补注时间：{term}→{term}（{year}年）")
+        return ("human", None, f"需补注时间但口径无法解析：{r}")
 
     # 1) 联系方式 -> 整句删除（按 。！？； 切句，删含联系渠道关键词的句子）
     if "联系方式" in r:
