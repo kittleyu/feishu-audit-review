@@ -662,6 +662,23 @@ def classify(quote, reply):
             subs = [(a, b) for a, b in zip(qp, rp)]
             return ("multi_replace", subs, f"全→多并列替换{subs}")
 
+    # 9.95) 单字「全」精细化：评论仅标了单字「全」，回复是扩展/删除口径。
+    #       绝不能无差别把全篇「全」替换（会破坏 全国/全面 等固定词）；落地时由
+    #       process_article 用评论 content_anchor_id 限定到锚定块。
+    #       - 回复含「广泛覆盖」→ 整体「全覆盖」→「广泛覆盖」（只换单字会成「广泛覆盖覆盖」）
+    #       - 回复含「多」→ 「全」→「多」，apply_edit 复合词感知保护 全面/全部/全国/全覆盖…
+    #       - 回复含「删除」→ 删单字「全」，apply_edit 去掉 覆 保护使「全覆盖」→「覆盖」
+    #       - 其他「全」回复（拿不准）→ 删该短语（锚定块内），绝不无差别替换
+    if q == "全":
+        if "广泛覆盖" in r:
+            # 整体「全覆盖」→「广泛覆盖」（old_sub/new_sub 明确；multi_replace 走锚点限定）
+            return ("multi_replace", [("全覆盖", "广泛覆盖")], "全覆盖→广泛覆盖")
+        if "多" in r:
+            return ("replace", "多", "全→多（复合词感知）")
+        if "删除" in r:
+            return ("delete", None, "删单字全（复合词感知）")
+        return ("delete", None, f"单字全→删短语「{q}」（{r}）")
+
     # 10) 回复无指令词：判断是否可作为『纯替换值』
     #     纯值（短、无说明性标点/叙述词）→ replace quote→reply
     #     非纯值（说明性长文/句子）→ 降级为删 quote 短句（绝不乱加内容）
@@ -712,6 +729,19 @@ def fuzzy_locate(phrase, btext):
                 if len(seg) >= al:
                     return seg
     return None
+
+
+def resolve_hits(btext, phrase, cmt_anchor, limit=1):
+    """定位含 phrase 的块。若评论带 content_anchor_id 且 phrase 为单字(<=limit)，
+    则**仅**在锚定块内查找——避免单字（全/最）无差别扩散到全篇、把 全国/全面 等
+    固定词也误改（曾见「全」→「广泛覆盖」把全篇「全」都替换成灾难）。多字短语(>limit)
+    仍全文定位（特异性足够，且 靠前/靠前家/中泰期货 等需文档级一致生效）。
+    锚定块内找不到 phrase → 返回 []（交由上层 unfound，绝不跨块扩散）。"""
+    if cmt_anchor and len(phrase) <= limit:
+        if phrase in (btext.get(cmt_anchor) or ""):
+            return [cmt_anchor]
+        return []
+    return [bid for bid, bt in btext.items() if phrase in bt]
 
 
 def locate_long_delete(phrase, btext):
@@ -824,13 +854,13 @@ def apply_edit(old, action, phrase, value):
             tmp = tmp.replace("\x00", "最")                     # 还原保护
             return tmp if tmp.strip() else old
         if phrase == "全":
-            # 单字「全」删除：仅删“全+自由名词”(全流程/全链条/全业务/全品种/全方位)，
-            # 保护固定词 全面/全部/完全/全权/全国/全覆盖
+            # 单字「全」删除：仅删“全+自由名词”，保护固定词 全面/全部/完全/全权/全国/全资
             # （避免「全面结算会员」→「面结算会员」、「全部变量」→「部变量」式灾难）。
-            PROT = "面部完权国覆资"
+            # 注意：刻意不保护「覆」（全覆盖→覆盖 正是删除意图，如「省级行政区的全覆盖网络」→「覆盖网络」）。
+            PROT = "面部完权国资"
             tmp = re.sub(r"全([" + PROT + r"])",
                          lambda m: "\uE000" + m.group(1), old)   # 占位保护固定词
-            tmp = re.sub(r"全[，。、；：]?", "", tmp)              # 删其余独立「全」
+            tmp = re.sub(r"全[，。、；：]?", "", tmp)              # 删其余独立「全」(含 全覆盖→覆盖)
             tmp = tmp.replace("\uE000", "全")                      # 还原保护词
             return tmp if tmp.strip() else old
         # 删短语及其后一个常见标点（，。、；：），全替换
@@ -909,6 +939,7 @@ def process_article(token, art, do_apply, backup):
         p = parse_comment_text(cmt)
         quote = (p.get("quote") or "").strip()
         reply = p["replies"][-1]["text"].strip() if p["replies"] else ""
+        cmt_anchor = (cmt.get("extra") or {}).get("content_anchor_id")
         action, value, note = classify(quote, reply)
         if action == "skip":
             # 审核已确认无误，保持原样，不计入人工/忽略
@@ -964,7 +995,7 @@ def process_article(token, art, do_apply, backup):
             # 所有正文块内做替换（同词多块也要落全，避免只改第一处显得没改）
             subs = value
             for (old_sub, new_sub) in subs:
-                hits = [bid for bid, bt in btext.items() if old_sub in bt]
+                hits = resolve_hits(btext, old_sub, cmt_anchor)
                 if not hits:
                     unfound(quote, reply, f"复合更正：未找到「{old_sub}」", cmt)
                     continue
@@ -977,12 +1008,18 @@ def process_article(token, art, do_apply, backup):
             continue
 
         phrase = collapse_dup(quote) if action == "replace" else quote
-        # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word
-        if action in ("replace", "delete_word") and phrase:
+        # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word，
+        # 且短语长度>1（单字 全/最 等不落标题，避免误伤标题里的 全国/全面 等）。
+        if action in ("replace", "delete_word") and phrase and len(phrase) > 1:
             title_candidates.append((action, phrase, value, note))
-        # 同词多块：必须应用到所有含该短语的块（否则评论锚在别的重复块上显得没改）
-        hit = [bid for bid, bt in btext.items() if phrase in bt]
+        # 同词多块：默认应用到所有含该短语的块；但若评论带锚点且 phrase 较短，
+        # 则 resolve_hits 已将其限定到锚定块（避免 全/最 等短词扩散到全篇）。
+        hit = resolve_hits(btext, phrase, cmt_anchor)
         if not hit:
+            # 锚定短词：锚定块内都找不到 phrase → 直接 unfound，绝不跨块扩散到全篇
+            if cmt_anchor and len(phrase) <= 3:
+                unfound(quote, reply, f"锚定块未找到「{phrase}」", cmt)
+                continue
             # 替换类长短语（>15字）：前缀定位 + 结束词补尾（解决评论截断，如「期货机」）
             if action == "replace" and len(phrase) > 15:
                 bid2, frag = locate_long_replace(phrase, btext, value)
