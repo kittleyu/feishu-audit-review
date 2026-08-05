@@ -884,6 +884,54 @@ def xxify(token):
     return "xx"
 
 
+def _safe_replace(old, phrase, value):
+    """子串替换（replace 动作用），对 value 含 phrase 的情况做幂等保护。
+
+    背景：skill 每次运行都会重处理「未解决」评论（铁律：绝不点解决评论），
+    故同一篇文章可能被 apply 多轮。普通替换（value 不含 phrase）一轮后 phrase
+    即从正文消失，重跑自然幂等；但当 value ⊇ phrase（如短机构名→以该短名开头
+    的全称「示例市示范口腔医疗服务有限责任公司」→「…示范口腔诊所（示范口腔）」），
+    替换后 value 内仍含 phrase，重跑会再次命中并把后缀再叠一份，3 轮即「XYYY」式
+    膨胀（已发生过的真实事故）。
+
+    幂等策略：value 含 phrase 时，跳过「已落在一段完整 value 内」的 phrase 命中
+    （即该位置已是上一轮替换留下的 value），只替换尚未替换的独立 phrase。这样
+    重跑对已替换文本为 no-op，不再膨胀。"""
+    if not phrase or value == phrase:
+        return old
+    if phrase not in old:
+        return old
+    if phrase not in value:
+        # value 不含 phrase：替换后 phrase 消失，重跑自然幂等
+        return old.replace(phrase, value)
+    # value 含 phrase：标记 old 中「已是完整 value」的区间，跳过其内的 phrase 命中
+    covered = []
+    start = 0
+    while True:
+        k = old.find(value, start)
+        if k < 0:
+            break
+        covered.append((k, k + len(value)))
+        start = k + len(value)
+
+    def _in_covered(i):
+        for cs, ce in covered:
+            if cs <= i < ce:
+                return True
+        return False
+
+    out = []
+    i, n = 0, len(old)
+    while i < n:
+        if old.startswith(phrase, i) and not _in_covered(i):
+            out.append(value)
+            i += len(phrase)
+        else:
+            out.append(old[i])
+            i += 1
+    return "".join(out)
+
+
 def apply_edit(old, action, phrase, value):
     if action == "sentence_delete":
         if value is None:
@@ -957,7 +1005,7 @@ def apply_edit(old, action, phrase, value):
             # 审核把「最早」里的「最」标成「较早」，本意是「最早」→「较早」
             tmp = old.replace("最早", "较早")
             return tmp if tmp.strip() else old
-    return old.replace(phrase, value)        # replace 全替换（含「改为 X」「资质」等）
+    return _safe_replace(old, phrase, value)  # replace 全替换（含「改为 X」「资质」等）；value⊇phrase 时幂等防膨胀
 
 
 # ====================== 发现 / 处理 ======================

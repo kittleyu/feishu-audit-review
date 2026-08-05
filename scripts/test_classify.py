@@ -84,6 +84,29 @@ def main():
         if not ok:
             fails += 1
         print(f"[{tag}] {desc}: act={act} val={val!r}  (期望 {exp_act}/{exp_val})")
+
+    # apply_edit 幂等性回归：value⊇phrase 时，多次重跑（模拟 skill 对未解决评论
+    # 的多轮 apply）不得把后缀叠成 XYYY。已发生事故：短机构名→全称 3 轮叠成三份后缀。
+    P = "示例市示范口腔医疗服务有限责任公司"          # phrase（短机构名）
+    S = "示范口腔诊所（示范口腔）"                      # 后缀
+    VAL = P + S                                       # value（全称，以 phrase 开头）
+    IDEM = [
+        ("replace首轮(原文本仅phrase)", "1. " + P, "1. " + VAL),
+        ("replace二轮(已替换,不膨胀)", "1. " + VAL, "1. " + VAL),
+        ("replace三轮(再跑仍不膨胀)", "1. " + VAL, "1. " + VAL),
+        ("replace独立phrase多次出现", P + "与" + P, VAL + "与" + VAL),
+    ]
+    for desc, old, exp in IDEM:
+        # 模拟连续 3 轮 apply_edit（每轮读取上一轮结果）
+        cur = old
+        for _ in range(3):
+            cur = A.apply_edit(cur, "replace", P, VAL)
+        ok = cur == exp
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            fails += 1
+        print(f"[{tag}] {desc}: 3轮后={cur!r}  (期望 {exp!r})")
+
     print(f"\n{'✅ ALL PASS' if fails == 0 else '❌ ' + str(fails) + ' FAILED'}")
     sys.exit(1 if fails else 0)
 
