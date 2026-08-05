@@ -343,7 +343,7 @@ def parse_suggest(r, q):
     # 必须锚定「建议改为/建议修改为/改为/可改为」标记，只从标记后取值；
     # 否则 (.+) 会从位置0贪婪捕获整句，把列举词(全流程/全方位)也卷进 vals，
     # 导致 vals[0] 取到「全流程」自己而非建议值。
-    m = re.search(r'(?:建议修改(?:为)?|建议改为|可\s*改为|更正为|需更正为|改为)[：:]?\s*-*\s*', r)
+    m = re.search(r'(?:建议修改(?:为)?|建议改为|可\s*改为|更正为|需更正为|改为|应为|应更改为|调整为|规范为|规格名称|规格为)[：:]?\s*-*\s*', r)
     if not m:
         return None
     after = r[m.end():]
@@ -380,6 +380,30 @@ def normalize_date_cn(s):
     return s
 
 
+def _looks_like_inst_fullname(r):
+    """回复是否像『纯机构/单位全称』（审核直接给的规范名，应 replace 而非删短语）。
+
+    判定：剥去末尾中文括号说明（如「（示范口腔）」）后以机构后缀结尾，且不含说明性
+    标点（，。、；：！？换行）与叙述连词（根据/显示/为/系/即/因/由/经/称/说明/实际/
+    与/和/但/故/建议/需/请/目前/运营/下设/注册/地址/位于），长度 ≤40。
+
+    例：『示例市示范口腔医疗服务有限责任公司示范口腔诊所（示范口腔）』→ True；
+        『该院目前运营的院区包括院本部、鹿泉院区…』→ False（无机构后缀+含叙述词）。"""
+    s = re.sub(r'（[^（）]*）$', '', r)  # 去掉末尾（...）说明
+    if not re.search(r'(公司|医院|诊所|门诊部|中心|学校|大学|银行|集团|'
+                     r'事务所|研究院|学院)$', s):
+        return False
+    if any(p in r for p in "，。、；：！？\n\r\t"):
+        return False
+    if any(w in r for w in ("根据", "显示", "为", "系", "即", "因", "由", "经",
+                            "称", "说明", "实际", "与", "和", "但", "故", "建议",
+                            "需", "请", "目前", "运营", "下设", "注册", "地址", "位于")):
+        return False
+    if len(r) > 40:
+        return False
+    return True
+
+
 def _is_pure_replace_value(r):
     """回复是否可作为『纯替换值』直接替换 quote。
 
@@ -391,6 +415,11 @@ def _is_pure_replace_value(r):
         '注册地址X与…实际主院区地址（Y）不符' / '建议改为知名专家' 不通过。"""
     if not r:
         return False
+    # 机构全称豁免：回复是审核直接给的规范机构名（如
+    # 「示例市示范口腔医疗服务有限责任公司示范口腔诊所（示范口腔）」），
+    # 应 replace 而非删短语。允许中文括号、允许超 15 字（机构名常较长）。
+    if _looks_like_inst_fullname(r):
+        return True
     if len(r) > 15:
         return False
     # 纯数字/编号类回复（如 "1"）不是合法替换词：写进正文会污染内容
@@ -1037,7 +1066,8 @@ def process_article(token, art, do_apply, backup):
                         e["ops"].append(("replace", old_sub, new_sub, note))
             continue
 
-        phrase = collapse_dup(quote) if action == "replace" else quote
+        q_clean = quote.replace("**", "").strip()
+        phrase = collapse_dup(q_clean) if action == "replace" else q_clean
         # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word，
         # 且短语长度>1（单字 全/最 等不落标题，避免误伤标题里的 全国/全面 等）。
         if action in ("replace", "delete_word") and phrase and len(phrase) > 1:
@@ -1278,7 +1308,13 @@ def cmd_review(dir_node, do_apply, from_index=None):
     tot_h = tot_ig = 0
     for d in wc:
         print(f"\n{'='*66}\n[{d['i']}] 《{d['title'][:40]}》\n{'='*66}")
-        h, ig = process_article(token, d, do_apply, backup)
+        try:
+            h, ig = process_article(token, d, do_apply, backup)
+        except Exception as _e:
+            import traceback as _tb
+            _tb.print_exc()
+            print(f"  ❌ 处理 [{d['i']}] 异常，跳过该篇继续：{_e!r}")
+            h, ig = 0, 0
         tot_h += h
         tot_ig += ig
     if do_apply and backup:
