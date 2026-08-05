@@ -70,6 +70,7 @@ description: 飞书 GEO 文章审核改稿闭环。给定客户目录 wiki node�
 - **极短串弱匹配误替换整句**：`fuzzy_locate` 对 ≤4 字要求近乎完全匹配，避免 "2006" 被弱前缀 "20" 误匹配正文 "2026年…" 后整句替换成 "2011"。
 - **整句删把列表项整块清空**：`apply_edit` 的 `sentence_delete` 删空时回退为只删定位短语+尾随标点，避免违规承诺/绝对化词残留。
 - **GBK 终端打印 emoji 崩溃**：脚本开头强制 `stdout/stderr` 用 UTF-8；`.bat` 加 `chcp 65001` + `PYTHONIOENCODING`。
+- **replace 跨轮重跑累加膨胀（重大事故，2026-08-05 修复）**：skill 每次重处理「未解决评论」（铁律不点解决），同一文档可能被 apply 多轮。当 replace 的 value ⊇ phrase（如短机构名→以该短名开头的全称「X公司」→「X公司Y诊所（Z）」）时，每轮重跑都会再次命中 value 内的 phrase 并再叠一份后缀，N 轮即把正文叠成 XYYY 式膨胀。已由 `_safe_replace` 幂等保护修复：value⊇phrase 时跳过「已落在完整 value 内」的 phrase 命中，重跑对已替换文本为 no-op。**教训：单轮内同 op 去重（key=action,phrase,value）只能防单轮内重复，防不了跨轮——跨轮幂等必须在替换函数本身做。**
 
 ## 用法
 ```bash
