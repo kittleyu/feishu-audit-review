@@ -393,6 +393,15 @@ def _is_pure_replace_value(r):
         return False
     if len(r) > 15:
         return False
+    # 纯数字/编号类回复（如 "1"）不是合法替换词：写进正文会污染内容
+    #（生成「覆盖1的期货公司」等），必须降级为「删 quote」（拿不准就删短语），
+    # 绝不能 replace 成 "1"。飞书评论里 "1" 多为编号/点赞等误入回复的噪声。
+    # 仅拒绝 ≤2 位的纯数字（编号噪声）；放行 4 位年份等合法数字替换值（如 2011）。
+    if re.fullmatch(r"\d+", r) and len(r) <= 2:
+        return False
+    # 单字符回复若非汉字，不可能是合法替换词（"1" "." "？" 等）
+    if len(r) <= 1 and not re.search(r"[\u4e00-\u9fff]", r):
+        return False
     if any(p in r for p in "，。、；：！？\n\r\t（）()「」“”\""):
         return False
     # 叙述性连词/动词，暗示这是一段说明而非替换词
