@@ -453,7 +453,7 @@ _CONFIRM_TOKENS = {
 
 def classify(quote, reply):
     """返回 (action, value, note); action ∈
-       {skip, replace, delete, delete_word, sentence_delete, xx_replace, delete_section, multi_replace, human}
+       {skip, replace, delete, delete_word, sentence_delete, xx_replace, delete_section, multi_replace, append, human}
        唯一规则：按评论修改；拿不准就把 quote 那段短句删掉；绝不把回复里的说明性
        文字当正文写进去（不乱加内容）。skip = 审核确认无误，保持原样不改动。"""
     q = quote.strip()
@@ -612,7 +612,7 @@ def classify(quote, reply):
     # 8) 无法核实 / 未查及（结构性，删整段/整家不确定）→ 人工
     #    仅匹配「无法核实/有待核实/未查及」等"无法确认"语义；不含单独的"核实"
     #    （如"经核实正确地址应为X"是已给新值的更正，不该归人工，应走更正/删短句）。
-    if any(k in r for k in ("有待核实", "无法核实", "未查及", "未查", "公开平台未查",
+    if any(k in r for k in ("有待核实", "无法核实", "未能核实", "未查及", "未查", "公开平台未查",
                             "未能验证", "无法验证")):
         return ("human", None, f"无法核实，需人工决定：{r}")
 
@@ -737,6 +737,16 @@ def classify(quote, reply):
         if _is_pure_replace_value(r):
             return ("replace", r, f"单字全→「{r}」（锚定块内替换）")
         return ("delete", None, f"单字全→删短语「{q}」（{r}）")
+
+    # 9.97) 添加类指令：加上/补充/补加 X → 在 quote 后追加「（X）」，不替换原句、不删事实。
+    #       审核本意是「补上机构名/限定词」而非改写或删除（如「该机构成立于2003年」→「加上示范口腔」
+    #       意为补注机构归属）。绝不能把「加上X」当纯替换值写进正文（会变成乱码「加上示范口腔」），
+    #       也绝不能删原句（丢失事实）。落地由 apply_edit 的 append 分支处理（幂等防跨轮重跑重复追加）。
+    m = re.search(r'^(?:加上|补加|补充[上入]?)\s*(.+)$', r)
+    if m:
+        add = m.group(1).strip().rstrip("。.，、；;")
+        if add:
+            return ("append", add, f"添加类指令→追加「（{add}）」到「{q}」")
 
     # 10) 回复无指令词：判断是否可作为『纯替换值』
     #     纯值（短、无说明性标点/叙述词）→ replace quote→reply
@@ -949,6 +959,17 @@ def apply_edit(old, action, phrase, value):
         return fallback if fallback else old
     if action == "delete_word":
         return old.replace(phrase, "")       # 全替换（同块/同词多出现都改）
+    if action == "append":
+        # 添加类指令（加上/补充 X）：在 phrase 后追加「（X）」，保留原句事实。
+        # 幂等：add 已出现在正文则 no-op，防跨轮重跑重复追加（如「（示范口腔）（示范口腔）」）。
+        add = value or ""
+        if not add:
+            return old
+        if add in old:
+            return old
+        if phrase and phrase in old:
+            return old.replace(phrase, phrase + "（" + add + "）", 1)
+        return old + "（" + add + "）"
     if action == "delete":
         if phrase == "最":
             # 绝对化用词「最」删除时，保护时间/顺序/方位复合词

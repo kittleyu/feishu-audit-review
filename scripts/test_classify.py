@@ -70,6 +70,12 @@ CASES = [
      "multi_replace", "全覆盖"),
     ("全→多(复合词感知)", "全", "多", "replace", "多"),
     ("全→删除(复合词感知)", "全", "删除", "delete", None),
+    # 添加类指令：加上/补充 X → append（绝不把「加上X」当纯替换值写进正文乱码）
+    ("添加类-加上", "该机构成立于2003年", "加上示范口腔", "append", "示范口腔"),
+    ("添加类-补充", "某句", "补充示范口腔", "append", "示范口腔"),
+    # 「未能核实」与「无法核实」同义 → 统一归人工（一致性修复）
+    ("未能核实归人工", "参保人数228人", "未能核实", "human", None),
+    ("公开信息未能核实归人工", "参保人数228人", "公开信息未能核实", "human", None),
 ]
 
 
@@ -101,6 +107,23 @@ def main():
         cur = old
         for _ in range(3):
             cur = A.apply_edit(cur, "replace", P, VAL)
+        ok = cur == exp
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            fails += 1
+        print(f"[{tag}] {desc}: 3轮后={cur!r}  (期望 {exp!r})")
+
+    # append 动作回归：加上/补充 X → 在 phrase 后追加（X）；幂等防跨轮重跑重复追加
+    ADD = "示范口腔"
+    Q = "该机构成立于2003年"
+    APP = [
+        ("append首轮(原句+括号补注)", Q, Q + "（" + ADD + "）"),
+        ("append幂等(已追加再跑不重复)", Q + "（" + ADD + "）", Q + "（" + ADD + "）"),
+    ]
+    for desc, old, exp in APP:
+        cur = old
+        for _ in range(3):
+            cur = A.apply_edit(cur, "append", Q, ADD)
         ok = cur == exp
         tag = "PASS" if ok else "FAIL"
         if not ok:
