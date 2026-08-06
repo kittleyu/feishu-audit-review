@@ -1144,6 +1144,24 @@ def process_article(token, art, do_apply, backup):
 
         q_clean = quote.replace("**", "").strip()
         phrase = collapse_dup(q_clean) if action == "replace" else q_clean
+        # 通用守卫：评论 quote 被截断、reply 已含应被吃掉的尾字时，在 anchor 块内把定位
+        # 短语向右扩展，连同尾字一并替换为 value（避免「value+尾字」冗余；并借更长短语
+        # 独占锚定块，规避同短语多块不同值的全文扩散冲突）。仅当评论带 anchor 且在 anchor
+        # 块内能匹配 phrase 时生效；无 anchor 不扩展（保守，不影响无锚点评论）。
+        if action == "replace" and cmt_anchor and cmt_anchor in btext and value:
+            _ab = btext[cmt_anchor]
+            _ap = _ab.find(phrase)
+            if _ap >= 0:
+                _suf = ""
+                _j = _ap + len(phrase)
+                while _j < len(_ab) and _ab[_j] not in "，。、；：！？\n ）) ":
+                    _suf += _ab[_j]; _j += 1
+                _best = 0
+                for _k in range(1, len(_suf) + 1):
+                    if value.endswith(_suf[:_k]) and _suf[:_k] and value[:-_k] not in ("", phrase):
+                        _best = _k
+                if _best and (phrase + _suf[:_best]) in _ab:
+                    phrase = phrase + _suf[:_best]
         # 标题候选（品牌名替换/绝对化删词也要落到标题）：仅 replace/delete_word，
         # 且短语长度>1（单字 全/最 等不落标题，避免误伤标题里的 全国/全面 等）。
         if action in ("replace", "delete_word") and phrase and len(phrase) > 1:
