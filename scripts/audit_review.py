@@ -404,6 +404,23 @@ def _looks_like_inst_fullname(r):
     return True
 
 
+# 审核「说明/标签」回复：核查结论或定性标签，绝不能作为替换值写进正文
+# （如「公开信息未发现注册资本消息」「无法报销」「荣誉归属错误」「数据错误」等）。
+# 这类回复一旦出现，classify 必须降级为「删 quote 短句」，绝不能 replace（否则字面写进正文）。
+# 注意：带显式替换值的回复（建议改为X/应为X/更名/地址为X）已被更早的分支拦截，
+# 不会落到这里；本正则只拦截「纯说明/标签」式回复。
+_AUDIT_NOTE_RE = re.compile(
+    r"(公开信息未发现|未发现|无法证实|未能证实|无法报销|待核实|需核实|"
+    r"未查询到|未查到|查无|荣誉归属错误|数据无法核实|数据错误|事实性错误|"
+    r"表述不当|内容错误|信息错误|归属错误)"
+)
+
+
+def _is_audit_note(r):
+    """回复是否只是审核的『核查结论/定性标签』而非替换值。"""
+    return bool(_AUDIT_NOTE_RE.search(r))
+
+
 def _is_pure_replace_value(r):
     """回复是否可作为『纯替换值』直接替换 quote。
 
@@ -412,8 +429,17 @@ def _is_pure_replace_value(r):
     否则视为审核员的说明性文字，调用方应降级为「删 quote 短句」而不是写进正文。
 
     例：'第一' / '雁塔西路277号' / '控股' 通过；
-        '注册地址X与…实际主院区地址（Y）不符' / '建议改为知名专家' 不通过。"""
+        '注册地址X与…实际主院区地址（Y）不符' / '建议改为知名专家' 不通过。
+        '公开信息未发现注册资本消息' / '无法报销' / '荣誉归属错误' / '安全'(单字) 不通过。"""
     if not r:
+        return False
+    # 单字符回复绝不当替换值：太模糊/危险（如「安全」→会把整句或标题替换成「安全」、
+    # 或覆盖合法文本；「最」「全」由 #9.95 / delete 专用分支感知处理）。一律降级为「删 quote」。
+    if len(r) <= 1:
+        return False
+    # 审核说明/标签回复：核查结论或定性标签（非替换值），必须降级为「删 quote」
+    # （否则会把「公开信息未发现…」「无法报销」「荣誉归属错误」等字面写进正文——灾难）。
+    if _is_audit_note(r):
         return False
     # 机构全称豁免：回复是审核直接给的规范机构名（如
     # 「示例市示范口腔医疗服务有限责任公司示范口腔诊所（示范口腔）」），
@@ -427,9 +453,6 @@ def _is_pure_replace_value(r):
     # 绝不能 replace 成 "1"。飞书评论里 "1" 多为编号/点赞等误入回复的噪声。
     # 仅拒绝 ≤2 位的纯数字（编号噪声）；放行 4 位年份等合法数字替换值（如 2011）。
     if re.fullmatch(r"\d+", r) and len(r) <= 2:
-        return False
-    # 单字符回复若非汉字，不可能是合法替换词（"1" "." "？" 等）
-    if len(r) <= 1 and not re.search(r"[\u4e00-\u9fff]", r):
         return False
     if any(p in r for p in "，。、；：！？\n\r\t（）()「」“”\""):
         return False
@@ -670,9 +693,11 @@ def classify(quote, reply):
             if new_full != q:
                 return ("replace", new_full, f"地址更正「{olda}」→「{city}{newa}」")
 
-    # 9.6) 医疗保障承诺类违规表述 → 整句删（不应替换成"医疗保障承诺"四字）
+    # 9.6) 医疗保障承诺类违规表述 → 删短语（不用整句删，避免连带删掉同句合法事实
+    #      如「上级会诊转诊制度」，也保留句末句号防粘连）。quote 即审核高亮的承诺子句，
+    #      用 delete 精准移除即可；不应替换成「医疗保障承诺」四字，也不整句删。
     if "医疗保障承诺" in r or "医疗承诺" in r or "保障承诺" in r:
-        return ("sentence_delete", q, f"违规承诺表述→整句删「{q}」")
+        return ("delete", None, f"违规承诺表述→删短语「{q}」")
 
     # 9.7) 机构已注销/注销 → 删该机构整节（按机构名定位，描述口径不同也能命中）
     #    注意「已于2025年9月10日注销」这类把「已」与「注销」用日期隔开的变体，
@@ -754,6 +779,14 @@ def classify(quote, reply):
         add = m.group(1).strip().rstrip("。.，、；;")
         if add:
             return ("append", add, f"添加类指令→追加「（{add}）」到「{q}」")
+
+    # 9.99) 回复是 quote 内的一个词（标注/注解，非替换值）：审核高亮了一整段，
+    #       回复只是其中某个关键词（如 quote="操作的安全性"、reply="安全"），
+    #       意为「这个词有问题，删掉它」→ 删 quote 短语（拿不准删短句），
+    #       绝不能把「安全」当 replace 值写进正文（会把整句/标题替换成「安全」灾难）。
+    #       仅短回复(2~4字)且为 quote 子串时触发，避免误伤正常替换值（如「第一」「控股」）。
+    if 2 <= len(r) <= 4 and r and r in q:
+        return ("delete", None, f"回复为 quote 内关键词（注解）→删短语「{q}」")
 
     # 10) 回复无指令词：判断是否可作为『纯替换值』
     #     纯值（短、无说明性标点/叙述词）→ replace quote→reply
@@ -949,6 +982,29 @@ def _safe_replace(old, phrase, value):
     return "".join(out)
 
 
+def _is_punct_only(s):
+    """字符串是否仅由标点/空白构成（删短语后残留孤立句号等，应视为空块）。"""
+    return all(c in "，。、；：！？…—" for c in s)
+
+
+def _delete_phrase(old, phrase):
+    """删短语：优先连同前导标点(，、；：)一起移除并保留句末句号，避免
+    「X，承诺表述。其余。」删承诺后变成「X，其余。」的粘连/丢句号。
+
+    - 短语前有前导标点（如「，可为用户提供安全的诊疗保障」）→ 连前导标点一起删，
+      保留句末句号：「...上级会诊转诊制度。」（合法事实+句号都保留）。
+    - 找不到前导标点（句末短语场景，如「推荐约牛股票。」）→ 移除短语及其后一个尾标点
+      （原行为），避免残留「推荐。其他内容。」里的孤立句号。"""
+    if not phrase or phrase not in old:
+        return old
+    pat = re.compile(r"[，、；：]\s*" + re.escape(phrase))
+    new = pat.sub("", old)
+    if new != old:
+        return new
+    # 句末短语场景：移除短语及其后一个尾标点
+    return re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
+
+
 def apply_edit(old, action, phrase, value):
     if action == "sentence_delete":
         if value is None:
@@ -998,10 +1054,12 @@ def apply_edit(old, action, phrase, value):
             tmp = re.sub(r"全[，。、；：]?", "", tmp)              # 删其余独立「全」(含 全覆盖→覆盖)
             tmp = tmp.replace("\uE000", "全")                      # 还原保护词
             return tmp if tmp.strip() else old
-        # 删短语及其后一个常见标点（，。、；：），全替换
-        new = re.sub(re.escape(phrase) + r"[，。、；：]?", "", old)
-        if not new.strip():
-            # 评论要删的整段几乎就是整块全部内容 → 标记删除整块（不再保留空块）
+        # 通用删短语：优先「前导标点(，、；：) + 短语」整体移除，保留句末句号防粘连
+        # （医疗保障承诺/标签类删短语常是「X，承诺表述。」→「X。」而非「X，」）；
+        # 找不到前导标点（句末短语场景）则移除短语及其后一个尾标点（原行为）。
+        new = _delete_phrase(old, phrase)
+        if not new.strip() or _is_punct_only(new.strip()):
+            # 评论要删的短语几乎就是整块全部内容 → 标记删除整块（不再保留空块/孤立标点）
             residual = old.replace(phrase, "").strip()
             if len(residual) <= 1:
                 return ""                      # 空标记：process_article 将删除该 block
