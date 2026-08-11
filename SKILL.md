@@ -107,3 +107,32 @@ python scripts/test_classify.py
 - 依赖：Python `requests`。
 - 默认 dry-run；`--apply` 才写。备份可一键还原。
 - **客户无关通用版**：规则全从评论指令词推导，不内置任何客户名/行业特定替换表，可直接复用任意客户。
+
+## 调试模板（BLOCK_FIX 模式，应急兜底）
+
+当核心 classify 在某目录仍产生灾难性结果（审核说明写进正文 / 整句删过度删合法事实 / 单字删毁文 / 弯引号 no-op / 粘连丢句号 / 叠字 / `#9.4` 硬编码截断 等），**不要改核心脚本**，改用通用模板对该目录做「定点覆盖 + 其余自动」的精准修正。模板是最近 5 个真实 `fix_*.py` 的并集提炼：
+
+```
+templates/debug_blkfix.py
+```
+
+四机制（用法与灾难→写法对照见模板文件顶部注释）：
+```bash
+# 只读预览每篇改动
+python templates/debug_blkfix.py --dir <node_token> --dry
+# 真实写回 + 备份 + 读回校验
+python templates/debug_blkfix.py --dir <node_token>
+```
+
+- **① BLOCK_FIX`（block_id → [(action, find, repl)])`——按块覆盖该块所有自动 op**：
+  - `('replace', 'find', '')` 纯子串移除、**不吃尾标点**（保留句号，防粘连）——最常用，如医疗保障承诺只删短语保合法事实。
+  - `('replace', 'find', 'repl')` 整词替换（防粘连 `行业头部→行业前列` / 防叠字 `全业务流程→完整业务流程`）。
+  - `('delete', '短语', '')` 删除短语（默认吞一个尾标点）。
+  - `[]` 空列表 = 该块**归人工不动**（压掉技能自动删，常用于防单字毁文 / 标题割裂）。
+- **② OVERRIDE`((block_id, 评论quote) → (find, repl))`——跳过该评论的 classify、直接精准替换**：适合 `#9.4` 硬编码把长回复截坏、或把说明当替换值的情况（如 G5GF「靠前家上市公司→较早上市的期货公司」、QuYQ 整句扩删）。
+- **③ SKIP`((block_id, 评论quote))`——整条评论跳过**：防全文匹配误伤同文档其它句子（如单字「安全」命中「误区」段多句）。
+- **④ TITLE_OVERRIDE`(旧标题 → 新标题)`——按标题整体替换**：评论要改的是页面标题而非正文块时（G5GF 用）。
+
+> **find 串铁律**：必须带原文真实的前导标点（逗号/顿号/句号），否则删后出现双标点或粘连；引号/标点须与文档逐字符一致（弯引号 `""` U+201C/D vs 直引号 `"`、输入法 unicode 归一都会导致 `phrase not in old` 静默 no-op，调试时用 `chr()` 构造或逐字符 codepoint 核对）。
+
+> 客户专属的 `fix_*.py` / 备份 JSON 已被 `.gitignore` 忽略、不进公共仓库；**只有 `templates/debug_blkfix.py` 这份通用模板随 skill 一起分享**，使用时填入你的目录 node 与 BLOCK_FIX 即可。
