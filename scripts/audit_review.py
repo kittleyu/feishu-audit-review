@@ -25,6 +25,7 @@ import json
 import re
 import sys
 import os
+from collections import defaultdict
 
 import requests
 
@@ -724,17 +725,31 @@ def classify(quote, reply):
             or r.strip() in ("修改", "规范", "规范表述"):
         return ("delete", None, f"动作标签「{r}」→删短语「{q}」")
 
-    # 9.4) 「靠前家」→ 前列的/较早的/第一 等（审核常把"行业靠前家"标成"行业前列的"；
-    #       长句评论如「行业靠前家上市公司，也是山东省靠前家金融类」→「靠前——行业前列的」
-    #       也是同一意图：把"靠前家"改成"前列的"。统一按"靠前家"锚点替换，避免整段误替/误删。
-    #       不影响「靠前步/靠前笔/靠前个/靠前」等其它"靠前"修正。
+    # 9.4) 「靠前家」→ 审核回复给出的替换词（前列的/较早/较早的/位于行业前列的/第一…）。
+    #       审核回复 r 本身就是「靠前家」这个 token 的替换值，必须尊重 r 的真实值，
+    #       不能无差别套硬编码预设（会吞掉更长更精确的回复，如「位于行业前列的」被截成
+    #       「前列的」），也不能给「较早」硬加「的」变成「较早的」。
+    #       描述性/长文回复（非纯替换值）→ 降级删短语，绝不把说明文字写进正文。
+    #       同块若出现两个「靠前家」且评论给了不同替换值，由 process_article 按 occurrence
+    #       顺序逐次消费（避免全局替换把多处并成同一值）。
     if "靠前家" in q:
+        rv = r.strip().rstrip("。.，、；;：")
+        # 局部校验：回复是「靠前家」的替换值（短、无指令词）。
+        # 注意：刻意不用全局 _is_pure_replace_value（其把「位于」列为连词会误拒合法值
+        # 如「位于行业前列的」）；这里只拦真正的指令/说明词，放行「位于/为」等合法值片段。
+        _INST_WORDS = ("建议", "需", "请", "改为", "说明", "不符", "实际",
+                       "与", "和", "但", "故", "经", "称", "系", "即", "因",
+                       "由", "根据", "显示", "应为")
+        if rv and 0 < len(rv) <= 12 and not any(w in rv for w in _INST_WORDS):
+            return ("multi_replace", [("靠前家", rv)], f"靠前家→{rv}")
+        # 描述性回复（含指令词/较长说明）兜底：从回复抽预设关键词，避免把整段说明写进正文
         if "前列" in r:
             return ("multi_replace", [("靠前家", "前列的")], "靠前家→前列的")
         if "较早" in r:
             return ("multi_replace", [("靠前家", "较早的")], "靠前家→较早的")
         if "第一" in r:
             return ("multi_replace", [("靠前家", "第一")], "靠前家→第一")
+        return ("delete", None, f"靠前家相关→删短语「{q}」")
 
     # 9.9) 「全X、全Y」→「多X、多Y」类并列更正：审核把一列"全XX"改成"多XX"
     #       （如 全品种、全业务链 → 多品种、多业务）。按位置映射逐子串替换，
@@ -1202,6 +1217,12 @@ def process_article(token, art, do_apply, backup):
 
         q_clean = quote.replace("**", "").strip()
         phrase = collapse_dup(q_clean) if action == "replace" else q_clean
+        # 去尾标点守卫：评论 quote 常把句末标点（。！？；）一起高亮，但替换值 value 不含
+        # 该标点。若不剥离，会把句号一并替换掉造成「广泛覆盖这意味着」式粘连。
+        # 仅当 value 不以该标点结尾时才剥离（value 自带标点则不剥，避免双标点）。
+        if action == "replace" and value and phrase and phrase[-1] in "。！？；" \
+                and not value.endswith(phrase[-1]):
+            phrase = phrase[:-1]
         # 通用守卫：评论 quote 被截断、reply 已含应被吃掉的尾字时，在 anchor 块内把定位
         # 短语向右扩展，连同尾字一并替换为 value（避免「value+尾字」冗余；并借更长短语
         # 独占锚定块，规避同短语多块不同值的全文扩散冲突）。仅当评论带 anchor 且在 anchor
@@ -1262,9 +1283,37 @@ def process_article(token, art, do_apply, backup):
 
     for bid, e in edits.items():
         new = e["original"]
+        ops = sorted(e["ops"], key=lambda x: -len(x[1]))
+        # 同 phrase 的 replace 多 op（如一块内两个「靠前家」给了不同替换值）→ 逐 occurrence
+        # 消费，避免全局替换把多处并成同一值（#9.4 同块多值场景）。仅当同 phrase 的 op ≥2
+        # 才启用逐次替换；其余（含单 op 的 中泰期货→中泰证券 等）走普通 apply_edit，行为不变。
+        phrase_groups = defaultdict(list)
+        for i, (a, ph, v, n) in enumerate(ops):
+            if a == "replace":
+                phrase_groups[ph].append(i)
+        applied_idx = set()
+        for ph, idxs in phrase_groups.items():
+            if len(idxs) <= 1:
+                continue
+            occ, start = 0, 0
+            while True:
+                pos = new.find(ph, start)
+                if pos < 0:
+                    break
+                if occ < len(idxs):
+                    _, _, v, _ = ops[idxs[occ]]
+                    new = new[:pos] + v + new[pos + len(ph):]
+                    applied_idx.add(idxs[occ])
+                    start = pos + len(v)
+                else:
+                    start = pos + len(ph)
+                occ += 1
         # 同一块多条编辑：按 phrase 长度从长到短，避免短词先替换破坏长词
         #   （如「某资质团队」须先于「某资质」，避免短词先替换破坏长词）
-        for a, ph, v, _ in sorted(e["ops"], key=lambda x: -len(x[1])):
+        #   已按 occurrence 处理的重复 phrase op 跳过（applied_idx），避免二次替换/膨胀。
+        for i, (a, ph, v, _) in enumerate(ops):
+            if i in applied_idx:
+                continue
             new = apply_edit(new, a, ph, v)
         e["new"] = new
         if new == "":
