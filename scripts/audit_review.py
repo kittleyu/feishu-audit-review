@@ -1197,13 +1197,13 @@ def discover_dir(token, node_token):
     return docs
 
 
-def process_article(token, art, do_apply, backup):
+def process_article(token, art, do_apply, backup, extra_rules=None):
     obj = art["obj"]
     comments = art["comments"]
     blocks = get_doc_blocks(token, obj)
     btext = {b.get("block_id"): extract_block_text(b) for b in blocks}
 
-    edits, human, ignored, section_deletes = {}, [], [], []
+    edits, human, ignored, section_deletes, skipped = {}, [], [], [], []
     block_deletes = {}   # delete 动作导致整块清空 → 真正删除该 block
     def unfound(q, r, n, c):
         """找不到锚点时的处置：已点赞(用户已手动改)→忽略；否则→归人工。"""
@@ -1220,7 +1220,10 @@ def process_article(token, art, do_apply, backup):
         cmt_anchor = (cmt.get("extra") or {}).get("content_anchor_id")
         action, value, note = classify(quote, reply)
         if action == "skip":
-            # 审核已确认无误，保持原样，不计入人工/忽略
+            # 审核确认不改动（或客户专属闸门/规则拦截）：内容保持原样，评论保留。
+            # ⚠️ 必须显式记录——静默 continue 会让审核读报告误以为评论被处理/删掉，
+            #    进而手动在飞书解决评论，造成「评论删了、内容没改」的假象。
+            skipped.append({"quote": quote, "reply": reply, "note": note})
             continue
         if action == "human":
             human.append({"quote": quote, "reply": reply, "note": note})
@@ -1547,7 +1550,11 @@ def process_article(token, art, do_apply, backup):
         print(f"  👤 需人工: {h['note']} | 「{h['quote'][:24]}」→「{h['reply'][:24]}」")
     for ig in ignored:
         print(f"  🙈 已忽略(点赞): {ig['note']} | 「{ig['quote'][:24]}」")
-    return len(human), len(ignored)
+    for sk in skipped:
+        print(f"  ⏭️ 跳过(评论保留·内容未改): 「{sk['quote'][:28]}」→「{sk['reply'][:28]}」 ({sk['note']})")
+    if skipped:
+        print(f"  ⚠️ 上述 {len(skipped)} 条评论按规则保留未改，请勿在飞书解决/删除。")
+    return len(human), len(ignored), len(skipped)
 
 
 # ====================== 各子命令 ======================
@@ -1576,25 +1583,31 @@ def cmd_review(dir_node, do_apply, from_index=None):
     print(f"\n目录 {dir_node}：共 {len(docs)} 篇，有评论 {len(wc)} 篇"
           f"（无评论 {len(docs)-len(wc)} 篇已跳过）")
     backup = {}
-    tot_h = tot_ig = 0
+    tot_h = tot_ig = tot_sk = 0
     for d in wc:
         print(f"\n{'='*66}\n[{d['i']}] 《{d['title'][:40]}》\n{'='*66}")
         try:
-            h, ig = process_article(token, d, do_apply, backup)
+            h, ig, sk = process_article(token, d, do_apply, backup)
         except Exception as _e:
             import traceback as _tb
             _tb.print_exc()
             print(f"  ❌ 处理 [{d['i']}] 异常，跳过该篇继续：{_e!r}")
-            h, ig = 0, 0
+            h, ig, sk = 0, 0, 0
         tot_h += h
         tot_ig += ig
+        tot_sk += sk
     if do_apply and backup:
         fn = f"{dir_node}_backup.json"
         with open(fn, "w", encoding="utf-8") as f:
             json.dump(backup, f, ensure_ascii=False, indent=2)
         print(f"\n✅ 备份 {fn}（{sum(len(v) for v in backup.values())} 块）")
-    print(f"\n⚠️ 评论均未点解决（铁律）。自动忽略(已点赞) {tot_ig} 条，仍需人工 {tot_h} 条。")
-    print("   交由审核人员处理评论状态即可。")
+    print(f"\n⚠️ 评论均未点解决（铁律）。自动忽略(已点赞) {tot_ig} 条，"
+          f"跳过未改 {tot_sk} 条，仍需人工 {tot_h} 条。")
+    if tot_sk:
+        print(f"   ⚠️ {tot_sk} 条「跳过未改」的评论仍保留在飞书，请勿解决/删除，"
+              f"交由审核人员按规则确认。")
+    else:
+        print("   交由审核人员处理评论状态即可。")
 
 
 def cmd_titles(dir_node, from_index=None):
