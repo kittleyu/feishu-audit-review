@@ -12,7 +12,8 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import audit_review as A
 
-# (desc, quote, reply, expected_action, expected_value_substr_or_None)
+# (desc, quote, reply, expected_action, expected_value_or_None)
+# replace/delete_section 用相等判断；multi_replace/xx_replace 用子串判断。
 CASES = [
     ("联系方式整句删", "客服热线：400-123 咨询微信xxx", "联系方式",
      "sentence_delete", None),
@@ -25,16 +26,27 @@ CASES = [
     ("地址为更正", "西五路157号", "地址为 雁塔西路277号", "replace", "雁塔西路277号"),
     ("地址不符更正", "注册地址为陕西省西安市新城区西五路157号",
      "注册地址为陕西省西安市新城区西五路157号与雁塔西路277号不符，实际主院区地址（雁塔西路277号）",
-     "replace", "雁塔西路277号"),
+     "replace", "注册地址为陕西省西安市雁塔西路277号"),
+    # BUG1 守护：地址更正绝不把「与…不符/实际主院区」说明文写进正文，且保留「注册地址为」前缀。
+    # 旧代码 m_city 的 [\u4e00-\u9fa5]{2,} 贪婪会把「注册地址为」当省名吞掉，
+    # 或吞掉「为」字（→「注册地址陕西省西安市…」坏句）；现统一 _ADDR_OLD_RE{2,3}+前缀剥离。
+    ("地址不符-位于(无省)", "注册地址为西安市新城区西五路157号",
+     "唐都医院实际位于陕西省西安市雁塔区雁塔西路277号，与注册地址不符",
+     "replace", "注册地址为陕西省西安市雁塔区雁塔西路277号"),
+    ("地址不符-位于(有省)", "注册地址为陕西省西安市新城区西五路157号",
+     "唐都医院实际位于陕西省西安市雁塔区雁塔西路277号，与注册地址不符",
+     "replace", "注册地址为陕西省西安市雁塔区雁塔西路277号"),
+    ("地址纯值但特征不全→保守删(不写说明文)", "注册地址为陕西省西安市新城区西五路157号",
+     "注册地址为陕西省西安市雁塔西路277号", "delete", None),
     ("未查及归人工", "某机构", "未查及", "human", None),
     ("长说明非纯值→删(不乱加)", "某短语",
      "这是一段说明性文字解释为什么不对因为审核认为有误", "delete", None),
     ("纯替换词", "靠前", "第一", "replace", "第一"),
     ("纯替换词年份", "2006", "2011", "replace", "2011"),
-    ("建议改为", "某主体评级", "建议改为 AAA级（2024年取得）", "replace", "AAA级"),
+    ("建议改为", "某主体评级", "建议改为 AAA级（2024年取得）", "replace", "AAA级（2024年取得）"),
     ("xx代替", "某期货公司", "用xx代替", "xx_replace", None),
     ("复合更正", "成立日期：2006年10月12日；地址：新建南路152号",
-     "成立日期：2011年6月28日；地址：魏都大道1306号", "multi_replace", None),
+     "成立日期：2011年6月28日；地址：魏都大道1306号", "multi_replace", "2011年6月28日"),
     ("标注类删", "description", "无意义英文", "delete", None),
     ("动作标签删", "某某", "修改", "delete", None),
     ("数据无法溯源删", "具体数据无法溯源", "具体数据无法溯源核实", "sentence_delete", None),
@@ -111,7 +123,10 @@ def main():
         act, val, note = A.classify(q, r)
         ok = (act == exp_act)
         if exp_val is not None:
-            ok = ok and (exp_val in str(val))
+            if exp_act in ("replace", "delete_section"):
+                ok = ok and (str(val) == exp_val)   # 相等：防"含子串但值错误"假阳性
+            else:  # multi_replace / xx_replace 等 list 型 → 子串
+                ok = ok and (exp_val in str(val))
         tag = "PASS" if ok else "FAIL"
         if not ok:
             fails += 1
@@ -184,6 +199,25 @@ def main():
         if not ok:
             fails += 1
         print(f"[{tag}] {desc}: delete({ph!r}) => {cur!r}  (期望 {exp!r})")
+
+    # BUG4 守护：sentence_delete 整块都是联系方式句时返回空串（触发整块删除），
+    # 绝不返回原文残留；phrase=None 不崩溃（旧代码 old.replace(None) TypeError）。
+    SDEL = [
+        ("sentence_delete整块清空(返回空串)",
+         "客服热线：400-123 咨询微信xxx", "客服热线：400-123 咨询微信xxx", ""),
+        ("sentence_delete保留其他句",
+         "第一句。客服热线：400-123 咨询微信xxx。第二句。",
+         "客服热线：400-123 咨询微信xxx", "第一句。第二句。"),
+        ("sentence_delete phrase=None不崩溃",
+         "某句正文", None, "某句正文"),
+    ]
+    for desc, old, ph, exp in SDEL:
+        cur = A.apply_edit(old, "sentence_delete", ph, None)
+        ok = cur == exp
+        tag = "PASS" if ok else "FAIL"
+        if not ok:
+            fails += 1
+        print(f"[{tag}] {desc}: sentence_delete({ph!r}) => {cur!r}  (期望 {exp!r})")
 
     print(f"\n{'✅ ALL PASS' if fails == 0 else '❌ ' + str(fails) + ' FAILED'}")
     sys.exit(1 if fails else 0)

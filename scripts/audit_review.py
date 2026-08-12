@@ -63,8 +63,25 @@ def _load_credentials():
     return app_id, app_secret
 
 APP_ID, APP_SECRET = _load_credentials()
-# 以下为使用者自己的飞书基础设施标识，建议通过环境变量覆盖（避免在公开仓库写死）
-SPACE_ID_GEO = os.environ.get("FEISHU_SPACE_ID_GEO", "7630734017544981692")   # GEO 文章空间（默认仅适配本机使用者，可改）
+# 飞书 wiki 空间 ID（必填）：通过环境变量 FEISHU_SPACE_ID 提供（兼容旧名
+# FEISHU_SPACE_ID_GEO），或命令行 --space-id 覆盖。绝不写死私有默认值。
+SPACE_ID_GEO = os.environ.get("FEISHU_SPACE_ID") or os.environ.get("FEISHU_SPACE_ID_GEO")
+_SPACE_ID_CLI = None   # 命令行 --space-id 覆盖（由 main() 设置）
+
+
+def set_space_id(sid):
+    """命令行 --space-id 注入空间 ID（优先级最高）。"""
+    global _SPACE_ID_CLI
+    _SPACE_ID_CLI = sid
+
+
+def resolve_space_id(node_space_id=None):
+    """解析有效空间 ID：命令行 > 节点自带 > 环境变量。均无则报错退出。"""
+    sid = _SPACE_ID_CLI or node_space_id or SPACE_ID_GEO
+    if not sid:
+        print("❌ 缺少飞书空间 ID。请通过环境变量 FEISHU_SPACE_ID 或命令行 --space-id 提供。")
+        sys.exit(1)
+    return sid
 
 # 联系方式整句删除的触发词
 CONTACT_KW = ["客服热线", "400-", "热线", "电子邮箱", "@", "微信公众号",
@@ -109,7 +126,7 @@ def list_wiki_children(token, space_id, parent_node_token, page_size=50):
 
 def get_node_info(token, node_token):
     d = api("GET",
-            f"https://open.feishu.cn/open-apis/wiki/v2/spaces/{SPACE_ID_GEO}/nodes/{node_token}",
+            f"https://open.feishu.cn/open-apis/wiki/v2/spaces/{resolve_space_id()}/nodes/{node_token}",
             token)
     return (d.get("data") or {}).get("node") or {}
 
@@ -422,6 +439,47 @@ def _is_audit_note(r):
     return bool(_AUDIT_NOTE_RE.search(r))
 
 
+# 地址提取守卫：从审核回复里抽出的「新地址」若含叙述词或超长，则不是纯地址，
+# 绝不能写进正文（会把「与…不符」「实际主院区地址」等说明文当地址写进去）。
+# 触发即降级为「删 quote 短语」。长度上限 30（中文地址极少超此）。
+_ADDR_NARRATIVE_RE = re.compile(
+    r"(与|不符|实际|和|但|根据|显示|为|系|即|因|由|经|称|说明|建议|需|请|"
+    r"目前|运营|下设|注册|位于|主院区|院区|核实|查及|公开|变更|更正|错误|有误)"
+)
+_ADDR_FEATURE_RE = re.compile(r"(路|街|号|大厦|广场|镇|乡|道|幢|室)")
+
+# 地址主体提取（#9.52/#9.53 共用）：省?市+区+路号 / 纯路号。
+# ⚠️ ① 省/市/区名限 2-3 字（{2,3}）——旧的 {2,} 贪婪会把「注册地址为」这类前缀
+#       也当省名/市名吞掉（city 提取出「注册地址为陕西省西安市」的灾难根因）。
+#    ② 分支2（纯路号兜底）路名限 {1,4} 字——旧的 {2,} 从位置0贪婪吞整句
+#       （句尾有「号」即可命中），绕过分支1 的省市校验，同样吞掉前缀。
+#       例：「注册地址为陕西省西安市新城区西五路157号」必须只抓「西五路157号」
+#       或「陕西省西安市新城区西五路157号」，绝不能把「注册地址为」包进去。
+_ADDR_OLD_RE = re.compile(
+    r"((?:[\u4e00-\u9fa5]{2,3}省)?[\u4e00-\u9fa5]{2,3}市[\u4e00-\u9fa5]{1,3}[区县]"
+    r"[\u4e00-\u9fa5\d]*(?:路|街|号|大厦|广场|镇|乡)[\u4e00-\u9fa5\d]*"
+    r"|[\u4e00-\u9fa5\d]{1,4}(?:路|街道|街|号|大厦|广场|镇|乡)[\u4e00-\u9fa5\d]*)"
+)
+
+# #9.53 从旧地址里补回省/市名（括号内新地址常只有路号）：优先 省+市，其次 市。
+_ADDR_CITY_RE = re.compile(
+    r"([\u4e00-\u9fa5]{2,3}省[\u4e00-\u9fa5]{2,3}市|[\u4e00-\u9fa5]{2,3}市)"
+)
+
+# m_old 匹配可能把「为/地址/注册地址」等前缀词当省/市名开头吞进去
+# （如「注册地址为陕西省…」→「为陕西省…」），匹配后统一剥离，保证 olda 是纯地址主体。
+_ADDR_PREFIX_STRIP = re.compile(r"^(?:注册地址为|地址为|注册地址|地址|为|是)+")
+
+
+def _is_clean_address(addr):
+    """抽出的新地址是否「干净」（纯地址，非说明文）。"""
+    if not addr or len(addr) > 30:
+        return False
+    if _ADDR_NARRATIVE_RE.search(addr):
+        return False
+    return bool(_ADDR_FEATURE_RE.search(addr))
+
+
 def _is_pure_replace_value(r):
     """回复是否可作为『纯替换值』直接替换 quote。
 
@@ -565,7 +623,7 @@ def classify(quote, reply):
     # 3.7) 复合更正：成立日期 + 地址（"成立日期：X；地址：Y" / "注册日期：X；地址：Y"）
     #      审核把两类更正写在同一回复里；拆成多子串替换（仅替换引用段里确实存在的
     #      旧日期/旧地址，绝不把整段 quote 替换成回复原文）。
-    m_cdate = re.search(r"(?:成立日期|注册日期)[:：]\s*([0-9]{4}[-/.年]?[0-9]{0,2}[-/.]?[0-9]{0,2})", r)
+    m_cdate = re.search(r"(?:成立日期|注册日期)[:：]\s*([0-9]{4}[-/.年]?[0-9]{0,2}[-/.月]?[0-9]{0,2})", r)
     m_caddr = re.search(r"地址[:：]\s*([^；;]+)", r)
     if m_cdate or m_caddr:
         subs = []
@@ -583,7 +641,7 @@ def classify(quote, reply):
             return ("multi_replace", subs, f"复合更正：{subs}")
 
     # 4) 成立日期核对：查及成立日期：XXXX
-    m = re.search(r"查[及找]?成立日期[:：]\s*([0-9]{4}[-/.年]?[0-9]{0,2}[-/.]?[0-9]{0,2})", r)
+    m = re.search(r"查[及找]?成立日期[:：]\s*([0-9]{4}[-/.年]?[0-9]{0,2}[-/.月]?[0-9]{0,2})", r)
     if m:
         return ("replace", m.group(1), f"「{q}」→「{m.group(1)}」(成立日期核对)")
 
@@ -661,38 +719,46 @@ def classify(quote, reply):
         return ("replace", newaddr, f"「{q}」→「{newaddr}」(地址更正)")
 
     # 9.52) 地址更正（实际位于 X / X 为 YY 地址）：抽正确地址替换 quote 中的错误地址
-    #   审核回复指出旧地址错、给出实际地址，如"唐都医院实际位于西安市灞桥区新寺路1号"，
-    #   或"长乐西路127号为西京医院地址，唐都医院实际位于西安市灞桥区新寺路1号"。
-    #   须早于 #10 兜底 replace（否则整段说明会被当替换值写进正文）。仅替换地址部分，
-    #   保留「位于/际地址位于/实际地址位于」等前缀。
-    m_real = re.search(r"(?:实际)?位于([^，。；]+)", r)
-    if not m_real:
-        m_real = re.search(r"([\u4e00-\u9fa5]{2,}市[\u4e00-\u9fa5]{1,3}(?:区|县)"
-                           r"[\u4e00-\u9fa5\d]*(?:路|街|号)+[\u4e00-\u9fa5\d]*)", r)
-    if m_real:
-        newa = m_real.group(1).strip().rstrip("；;。、")
-        m_old = re.search(r"([\u4e00-\u9fa5]{2,}(?:省|市|区|县))?[\u4e00-\u9fa5\d]*"
-                           r"(?:路|街道|街|号|大厦|广场|镇|乡)[\u4e00-\u9fa5\d]*", q)
-        if m_old and m_old.group(0).strip() in q:
-            olda = m_old.group(0).strip()
-            new_full = q.replace(olda, newa)
-            if new_full != q:
-                return ("replace", new_full, f"地址更正「{olda}」→「{newa}」")
+    #   审核回复指出旧地址错、给出实际地址，如"唐都医院实际位于西安市灞桥区新寺路1号"。
+    #   须早于 #10 兜底 replace（否则整段说明会被当替换值写进正文）。仅替换地址部分。
+    #   ⚠️ 遇「不符」类 reply 跳过（交 #9.53 括号提取更可靠；本分支 fallback 正则
+    #      尾部 [\u4e00-\u9fa5\d]* 无界会吞"与…不符"说明文）；但 reply 含「位于」时
+    #      仍走本分支（第一个正则 位于([^，。；]+) 靠逗号截断，安全）。提取的新地址
+    #      须过 _is_clean_address 守卫（含叙述词/超长则降级删短语，绝不写说明文进正文）。
+    if "位于" in r or "不符" not in r:
+        m_real = re.search(r"(?:实际)?位于([^，。；]+)", r)
+        if not m_real:
+            m_real = re.search(r"([\u4e00-\u9fa5]{2,}市[\u4e00-\u9fa5]{1,3}(?:区|县)"
+                               r"[\u4e00-\u9fa5\d]*(?:路|街|号)+[\u4e00-\u9fa5\d]*)", r)
+        if m_real:
+            newa = m_real.group(1).strip().rstrip("；;。、")
+            if _is_clean_address(newa):
+                m_old = _ADDR_OLD_RE.search(q)   # 只抓地址主体，不吞「注册地址为」前缀
+                if m_old:
+                    olda = _ADDR_PREFIX_STRIP.sub("", m_old.group(0).strip())
+                    if olda and olda in q:
+                        new_full = q.replace(olda, newa)
+                        if new_full != q:
+                            return ("replace", new_full, f"地址更正「{olda}」→「{newa}」")
 
     # 9.53) 地址不符更正：注册地址X与…实际主院区地址（Y）不符 → 地址 X→Y
     #       审核用长说明指出旧地址错、正确地址在括号里；须早于 #10 兜底 replace
     #       （否则整段说明会被当替换词写进正文）。仅替换地址部分，保留「注册地址为」等前缀。
+    #       ⚠️ m_old 只抓地址主体（省?市+区+路号 / 纯路号），不吞「注册地址为」前缀
+    #          （旧正则贪婪会吞前缀，city 误带"注册地址为"）；m_city 用 search 在 olda
+    #          内找"X省Y市"（re.match 从开头会误吞前缀）；newa 须过 _is_clean_address。
     if "不符" in r:
         m_new = re.search(r"[（(]([^）)]{2,})[）)]", r)        # 括号里的正确地址
-        m_old = re.search(r"([\u4e00-\u9fa5]{2,}(?:省|市|区|县))?[\u4e00-\u9fa5]*(?:路|街道|街|号|大厦|广场|镇|乡)[^，。；]*", q)
+        m_old = _ADDR_OLD_RE.search(q)                        # 只抓地址主体，不吞前缀
         if m_new and m_old:
-            olda = m_old.group(0).strip()
+            olda = _ADDR_PREFIX_STRIP.sub("", m_old.group(1).strip())
             newa = m_new.group(1).strip()
-            m_city = re.match(r"([\u4e00-\u9fa5]{2,}省[\u4e00-\u9fa5]{2,}市)", olda)
-            city = m_city.group(1) if m_city else ""
-            new_full = q.replace(olda, city + newa)
-            if new_full != q:
-                return ("replace", new_full, f"地址更正「{olda}」→「{city}{newa}」")
+            if olda and _is_clean_address(newa):
+                m_city = _ADDR_CITY_RE.search(olda)   # 优先省+市，其次市
+                city = m_city.group(1) if m_city else ""
+                new_full = q.replace(olda, city + newa)
+                if new_full != q:
+                    return ("replace", new_full, f"地址更正「{olda}」→「{city}{newa}」")
 
     # 9.6) 医疗保障承诺类违规表述 → 删短语（不用整句删，避免连带删掉同句合法事实
     #      如「上级会诊转诊制度」，也保留句末句号防粘连）。quote 即审核高亮的承诺子句，
@@ -1032,9 +1098,13 @@ def apply_edit(old, action, phrase, value):
         new = "".join(kept)
         if new.strip():
             return new
-        # 整块清空则回退：改为只删定位短语(及尾随标点)，避免违规承诺/绝对化词残留
+        # 整块清空则回退：改为只删定位短语(及尾随标点)，避免违规承诺/绝对化词残留。
+        # 若回退后仍为空（整块都是要删的内容，如整块都是联系方式句）→ 返回空串触发整块清空，
+        # 绝不 return old 残留违规内容；phrase 为 None 时 old.replace(None) 会崩，直接清空。
+        if not phrase:
+            return ""
         fallback = re.sub(r"[，。、；：:]\s*$", "", old.replace(phrase, "")).strip()
-        return fallback if fallback else old
+        return fallback if fallback else ""
     if action == "delete_word":
         return old.replace(phrase, "")       # 全替换（同块/同词多出现都改）
     if action == "append":
@@ -1112,7 +1182,7 @@ def apply_edit(old, action, phrase, value):
 # ====================== 发现 / 处理 ======================
 def discover_dir(token, node_token):
     nd = get_node_info(token, node_token)
-    space_id = nd.get("space_id") or SPACE_ID_GEO
+    space_id = resolve_space_id(nd.get("space_id"))
     children = list_wiki_children(token, space_id, node_token)
     docs = []
     for i, it in enumerate(children):
@@ -1600,54 +1670,54 @@ def cmd_restore(backup_file):
 
 
 def main():
-    args = sys.argv[1:]
-    dir_node = None
-    do_apply = "--apply" in args
-    probe = "--probe" in args
-    titles = "--titles" in args
-    fix_title = "--fix-title" in args
-    restore = "--restore" in args
-    from_index = None
-    obj = newt = None   # --fix-title 的目标 obj / 新标题（循环内赋值）
+    import argparse
 
-    for j, a in enumerate(args):
-        if a == "--dir" and j + 1 < len(args):
-            dir_node = args[j + 1]
-        if a == "--from-index" and j + 1 < len(args):
-            try:
-                from_index = int(args[j + 1])
-            except ValueError:
-                from_index = None
-        if a == "--fix-title":
-            obj = args[j + 1] if j + 1 < len(args) else None
-            newt = args[j + 2] if j + 2 < len(args) else None
+    p = argparse.ArgumentParser(
+        prog="audit_review.py",
+        description="飞书 GEO 文章审核改稿：按评论批量修改有未解决评论的文章（备份+读回校验，绝不解评论）。",
+        epilog="示例:\n"
+               "  python audit_review.py --dir <wiki_node>                 # 只读模式，输出修改计划\n"
+               "  python audit_review.py --dir <wiki_node> --apply          # 应用修改（自动备份+读回校验）\n"
+               "  python audit_review.py --dir <wiki_node> --probe          # 只看该目录下所有文章标题\n"
+               "  python audit_review.py --dir <wiki_node> --titles         # 列出所有文章标题\n"
+               "  python audit_review.py --dir <wiki_node> --from-index 3   # 从第 3 篇开始\n"
+               "  python audit_review.py --fix-title <obj_token> <新标题>    # 单篇改标题\n"
+               "  python audit_review.py --restore backup.json              # 回滚备份",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+    )
+    p.add_argument("--dir", dest="dir_node", metavar="NODE",
+                   help="客户目录 wiki node（或文档 obj_token，单独处理单篇）")
+    p.add_argument("--probe", action="store_true", help="只列出目录下文章及评论数，不产出计划")
+    p.add_argument("--apply", action="store_true", help="应用修改（默认只读输出计划）")
+    p.add_argument("--titles", action="store_true", help="只列出目录下所有文章标题")
+    p.add_argument("--from-index", type=int, default=None, metavar="N",
+                   help="从第 N 篇文章开始处理（0 起）")
+    p.add_argument("--space-id", dest="space_id", default=None, metavar="SID",
+                   help="飞书 wiki 空间 ID（覆盖环境变量 FEISHU_SPACE_ID）")
+    p.add_argument("--fix-title", nargs=2, metavar=("OBJ_TOKEN", "新标题"),
+                   help="单篇改标题，不处理正文")
+    p.add_argument("--restore", metavar="BACKUP.json",
+                   help="回滚某次备份文件，不联网")
+    args = p.parse_args()
 
-    if restore:
-        # --restore <file>
-        rf = None
-        for j, a in enumerate(args):
-            if a == "--restore" and j + 1 < len(args):
-                rf = args[j + 1]
-        if not rf:
-            print("用法: python audit_review.py --restore <backup.json>")
-            sys.exit(1)
-        return cmd_restore(rf)
+    if args.space_id:
+        set_space_id(args.space_id)
 
-    if fix_title:
-        if not obj or not newt:
-            print("用法: python audit_review.py --fix-title <obj_token> <新标题>")
-            sys.exit(1)
-        return cmd_fix_title(obj, newt)
+    if args.restore:
+        return cmd_restore(args.restore)
 
-    if not dir_node:
-        print(__doc__)
+    if args.fix_title:
+        return cmd_fix_title(args.fix_title[0], args.fix_title[1])
+
+    if not args.dir_node:
+        p.print_help()
         sys.exit(1)
 
-    if titles:
-        return cmd_titles(dir_node, from_index)
-    if probe:
-        return cmd_probe(dir_node, from_index)
-    return cmd_review(dir_node, do_apply, from_index)
+    if args.titles:
+        return cmd_titles(args.dir_node, args.from_index)
+    if args.probe:
+        return cmd_probe(args.dir_node, args.from_index)
+    return cmd_review(args.dir_node, args.apply, args.from_index)
 
 
 if __name__ == "__main__":

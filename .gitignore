@@ -2,6 +2,7 @@ __pycache__/
 *.pyc
 *.backup.json
 *_backup.json
+*_backup_*.json
 .env
 # 客户专属一次性驱动脚本与产物（含目录 node / 客户名，勿入公共仓库）
 apply_*.py
