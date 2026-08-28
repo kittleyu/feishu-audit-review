@@ -68,10 +68,15 @@ NODE = 'REPLACE_WITH_YOUR_NODE'   # 改成你的目录 node；或用 --dir 覆�
 #    （输入法 unicode 归一、弯直引号差异都会导致 no-op，调试时用 codepoint 核对）。
 # =================================================================
 BLOCK_FIX = {
+    # ⚠️ KEY 用「完整 block_id」（含后缀，如 'doxcnXXXXabcd1234...'）最稳妥；
+    #    若只有 inspect 截断的 24 位前缀也能用——_resolve_bid 会自动前缀匹配
+    #    （前提是前缀能唯一确定一块）。早期版本用前缀会静默匹配不到 → 定点覆盖失效、
+    #    仍走核心 classify 出坏句（曾踩 3 次：日期写成字面标签、删短语变 "1. ****"、
+    #    短"安全"短语断句）。完整 id 从 --dry 输出 / inspect 脚本的 block_id 取。
     # 例：医疗保障承诺只删短语、保事实+句号
-    # 'doxcnXXXX': [('replace', '，为医师诊疗提供安全保障', '')],
+    # 'doxcnXXXXabcd1234...': [('replace', '，为医师诊疗提供安全保障', '')],
     # 例：归人工不动（防单字删毁文）
-    # 'doxcnYYYY': [],
+    # 'doxcnYYYYabcd1234...': [],
 }
 
 # =================================================================
@@ -126,6 +131,18 @@ def _expand_phrase(btext, cmt_anchor, phrase, value):
     return phrase
 
 
+def _resolve_bid(btext, key):
+    """BLOCK_FIX / DYNAMIC 的 key 可能是完整 block_id，也可能是被 inspect 脚本截断的
+    24 位前缀。统一解析成 btext 里的完整 block_id：精确匹配优先；否则取「唯一」前缀匹配。
+    （曾因用前缀做 key 静默匹配不到 → 定点覆盖失效、仍走核心 classify 出坏句，已踩 3 次）"""
+    if key in btext:
+        return key
+    hits = [b for b in btext if b.startswith(key)]
+    if len(hits) == 1:
+        return hits[0]
+    return None
+
+
 def main(node, dry=False):
     token = ar.get_token()
     docs = ar.discover_dir(token, node)
@@ -176,8 +193,9 @@ def main(node, dry=False):
                     e.append((action, phrase, value, note))
 
         # BLOCK_FIX 覆盖：按 block_id 显式覆盖该块所有自动 op（空列表=归人工不动）
-        for bid, fixes in BLOCK_FIX.items():
-            if bid in btext:
+        for key, fixes in BLOCK_FIX.items():
+            bid = _resolve_bid(btext, key)
+            if bid:
                 block_ops[bid] = [(a, f, r, 'blockfix') for (a, f, r) in fixes]
 
         # 应用：先自动 op（短语从长到短），再叠加 OVERRIDE 精准替换
