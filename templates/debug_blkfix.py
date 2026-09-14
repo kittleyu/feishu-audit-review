@@ -100,6 +100,17 @@ OVERRIDE = {
 SKIP = set()
 
 # =================================================================
+# ④b SKIP_QUOTES —— 按「评论 quote 的子串」整条跳过（★推荐，Woqi 实战新增）
+#    适用：结构性/建议性评论（如「标题为X信息盘点，实则只列举一家，可增补其他XX」
+#    「该部分标题与下面1,2,3点内容不符」）——classify 会兜底删 quote，而 quote 恰是
+#    小节标题 → 标题块被删空（带序号的「二、XX盘点」只剩「二」）。这类必须跳过、
+#    交用户定策略（增补同类条目 / 改标题），绝不让核心脚本删标题。
+#    例：SKIP_QUOTES = {'国内主流智能股票软件信息盘点', '主流产品客观信息盘点'}
+#    判定：reply 含 实则/可增补/可补充/内容不符/只有一家 + quote 短且无句末标点（标题）
+# =================================================================
+SKIP_QUOTES = set()
+
+# =================================================================
 # ⑤ TITLE_OVERRIDE —— 按文章标题整体替换（可选，G5GF 用）
 #    适用：评论要求改的是页面标题而非正文块。
 #    例：TITLE_OVERRIDE = {'旧标题含中泰期货': '新标题含中泰证券'}
@@ -170,6 +181,8 @@ def main(node, dry=False):
             cmt_anchor = (cmt.get('extra') or {}).get('content_anchor_id')
             # SKIP：整条评论跳过（防全文匹配误伤）
             if (cmt_anchor, quote) in SKIP:
+                continue
+            if any(sq in quote for sq in SKIP_QUOTES):
                 continue
             action, value, note = ar.classify(quote, reply)
             if action in ('skip', 'human'):
