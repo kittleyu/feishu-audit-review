@@ -115,13 +115,37 @@ def api(method, url, token, body=None, params=None):
     return d
 
 
-def list_wiki_children(token, space_id, parent_node_token, page_size=50):
+def list_wiki_children(token, space_id, parent_node_token, page_size=50,
+                       max_pages=20):
     url = f"https://open.feishu.cn/open-apis/wiki/v2/spaces/{space_id}/nodes"
-    params = {"page_size": page_size}
-    if parent_node_token:
-        params["parent_node_token"] = parent_node_token
-    d = api("GET", url, token, params=params)   # 注意：params 必须传
-    return (d.get("data") or {}).get("items", [])
+    children, page_token, seen_tokens = [], None, set()
+    for _ in range(max_pages):
+        params = {"page_size": page_size}
+        if parent_node_token:
+            params["parent_node_token"] = parent_node_token
+        if page_token:
+            params["page_token"] = page_token
+        d = api("GET", url, token, params=params)   # 注意：params 必须传
+        if not isinstance(d, dict) or d.get("code") != 0:
+            raise RuntimeError(
+                f"读取 wiki 子节点失败: {d.get('code') if isinstance(d, dict) else 'invalid response'} "
+                f"{d.get('msg', '') if isinstance(d, dict) else ''}"
+            )
+        data = d.get("data")
+        items = data.get("items") if isinstance(data, dict) else None
+        if not isinstance(items, list):
+            raise RuntimeError("读取 wiki 子节点失败: 响应缺少 data.items 列表")
+        children.extend(items)
+        if not data.get("has_more"):
+            return children
+        next_token = data.get("page_token")
+        if not next_token or next_token in seen_tokens:
+            raise RuntimeError("读取 wiki 子节点失败: 分页游标缺失或重复")
+        seen_tokens.add(next_token)
+        page_token = next_token
+    raise RuntimeError(
+        f"读取 wiki 子节点失败: 超过分页上限 {max_pages} 页，拒绝返回不完整结果"
+    )
 
 
 def get_node_info(token, node_token):

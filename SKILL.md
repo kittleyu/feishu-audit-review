@@ -32,7 +32,7 @@ description: 飞书 GEO 文章审核改稿闭环。给定客户目录 wiki node�
 - 块写：`PATCH /open-apis/docx/v1/documents/{obj}/blocks/{bid}`，body 用 `update_text_elements`（整块替换，与块类型无关）。
 - **改文档标题**：标题 = Page 根块的 `page.elements` 文本，block_id 就是 document_id 本身。PATCH `/documents/{obj}/blocks/{obj}`，body 用 `{"update_text_elements":{"elements":[{"text_run":{"content":"新标题"}}]}}` —— **注意：page 标题块不能带 `text_element_style`，否则报 1770001**。改后 wiki 节点名会自动同步。
 - 评论 reply 的 content 是 **dict**（elements[].text_run.text），不是 JSON 字符串；主评论 content 是 JSON 字符串数组。
-- 目录子节点：`GET /open-apis/wiki/v2/spaces/{space_id}/nodes?parent_node_token=...`，**务必把 params 传进去**。
+- 目录子节点：`GET /open-apis/wiki/v2/spaces/{space_id}/nodes?parent_node_token=...`，**务必把 params 传进去**。按 `page_token` 翻页，默认最多读取 20 页（每页 50 个）；API 报错、游标异常或超过上限时明确中止，不返回部分目录继续改稿。
 - 评论 anchor 经常为 None → 靠 quote 子串匹配定位块；多块同词时会指错块，通用方案支持「人工指定目标块」。
 - **取评论点赞**：列表接口 `GET /comments` 不返回点赞/reaction；需额外 `POST /drive/v1/files/{obj}/comments/batch_query`（`body={"comment_ids":[...],"need_reaction":true}`，`file_type` 放 query 参数）才能拿到 `reactions` 字段。
 
